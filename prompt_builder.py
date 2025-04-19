@@ -34,23 +34,31 @@ class PromptBuilder:
         )
 
     def build_intro_prompt(self, user_data: dict) -> str:
+        genre = user_data.get("genre", "Fantasy")
         char = user_data.get("character", {})
-        name = char.get("name", "Unknown Hero")
+        name = char.get("name", "Unnamed Hero")
         race = char.get("race", "Human")
         cls = char.get("class", "Adventurer")
+        motivation = char.get("motivation", "to seek glory and riches")
         abilities = char.get("abilities", {})
-        motivation = char.get("motivation", "glory and treasure")
+
         ability_text = "\n".join([f"{k}: {v}" for k, v in abilities.items()])
 
         return (
-            f"Create the opening scene of a fantasy adventure.\n"
+            f"You are the Dungeon Master.\n"
+            f"The player has created a character for a role-playing game.\n\n"
+            f"Genre: {genre}\n"
+            f"Let your first step be to imagine the tone, theme, and setting that match this genre. "
+            f"Do not ask the player to choose these — define them yourself.\n\n"
             f"Character:\n"
-            f"Name: {name}\n"
-            f"Race: {race}\n"
-            f"Class: {cls}\n"
-            f"Abilities:\n{ability_text}\n"
-            f"Motivation: {motivation}\n\n"
-            f"Now, where do we start?..."
+            f"  Name: {name}\n"
+            f"  Race: {race}\n"
+            f"  Class: {cls}\n"
+            f"  Motivation: {motivation}\n"
+            f"  Abilities:\n{ability_text}\n\n"
+            f"Begin the story with the character’s first significant challenge. "
+            f"Immerse the player in this world immediately — describe the setting and scene using the chosen tone and genre. "
+            f"Then prompt them for what they would like to do next."
         )
 
     def build_prompt(self, user_data: dict, user_input: str) -> str:
