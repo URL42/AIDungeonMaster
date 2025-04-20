@@ -112,8 +112,12 @@ async def roll_abilities_callback(update: Update, context: ContextTypes.DEFAULT_
 async def choose_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     motivation = update.message.text.strip()
     context.user_data.setdefault("character", {})["motivation"] = motivation
-    intro = prompt_builder.build_intro_prompt(context.user_data)
-    await update.message.reply_text(intro)
+
+    # Send GPT the prompt and reply to the user with its output
+    prompt = prompt_builder.build_intro_prompt(context.user_data)
+    response = game_manager.handle_freeform(prompt, context.user_data)
+    await update.message.reply_text(response)
+
     return GAME_LOOP
 
 # --- Game loop input ---
@@ -121,13 +125,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message.text
     context.user_data["last_action"] = message
 
-    keyboard = [[InlineKeyboardButton("🎲 Roll D20", callback_data="roll_d20")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    prompt = prompt_builder.build_prompt(context.user_data, message)
+    response = game_manager.handle_freeform(prompt, context.user_data)
 
-    await update.message.reply_text(
-        "Press the button below to roll a D20 and see what happens:",
-        reply_markup=reply_markup
-    )
+    # If GPT asks for a D20 roll, show the roll button
+    if "roll" in response.lower() and "d20" in response.lower():
+        keyboard = [[InlineKeyboardButton("🎲 Roll D20", callback_data="roll_d20")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(response)
+        await update.message.reply_text("Tap to roll a D20:", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(response or "What would you like to do next?")
+    return GAME_LOOP
 
 async def roll_d20_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
