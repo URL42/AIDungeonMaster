@@ -45,20 +45,19 @@ class PromptBuilder:
         ability_text = "\n".join([f"{k}: {v}" for k, v in abilities.items()])
 
         return (
-            f"You are the Dungeon Master.\n"
-            f"The player has created a character for a role-playing game.\n\n"
-            f"Genre: {genre}\n"
-            f"Let your first step be to imagine the tone, theme, and setting that match this genre. "
-            f"Do not ask the player to choose these — define them yourself.\n\n"
-            f"Character:\n"
-            f"  Name: {name}\n"
-            f"  Race: {race}\n"
-            f"  Class: {cls}\n"
-            f"  Motivation: {motivation}\n"
-            f"  Abilities:\n{ability_text}\n\n"
-            f"Begin the story with the character’s first significant challenge. "
-            f"Immerse the player in this world immediately — describe the setting and scene using the chosen tone and genre. "
-            f"Then prompt them for what they would like to do next."
+            f"You are a Dungeon Master narrating a roleplaying game.\n"
+            f"The genre is: {genre}.\n\n"
+            f"Here is the player’s character:\n"
+            f"Name: {name}\n"
+            f"Race: {race}\n"
+            f"Class: {cls}\n"
+            f"Motivation: {motivation}\n"
+            f"Abilities:\n{ability_text}\n\n"
+            f"Imagine the tone, theme, and setting that match this genre. "
+            f"Define these yourself. Then begin the story with the character’s first meaningful challenge. "
+            f"End your response with a clear challenge that requires the player to act.\n"
+            f"If a roll is needed, instruct the player to roll using the provided D20 button — but do not roll for them. "
+            f"Wait for the roll result before describing the outcome."
         )
 
     def build_prompt(self, user_data: dict, user_input: str) -> str:
@@ -71,6 +70,8 @@ class PromptBuilder:
             f"Location: {loc}\n"
             f"Character: {char}\n"
             f"History: {json.dumps(hist)}\n"
-            f"User says: {user_input}\n"
-            f"Continue the scene."
+            f"The player says: {user_input}\n"
+            f"Respond with narrative and possible consequences. If an ability check is needed, "
+            f"instruct the player to roll. Do not roll the dice or resolve the result yourself — wait for the roll."
         )
+
