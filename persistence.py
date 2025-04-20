@@ -232,3 +232,4 @@ class GameStateManager:
         except Exception as e:
             print(f"[handle_freeform ERROR]: {e}")
             return "⚠️ The Dungeon Master stares blankly, as if something broke in the multiverse..."
+
