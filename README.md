@@ -125,7 +125,7 @@ https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates
     }
   ]
 }
-
+```
 4. The number listed under "id" in the "chat" block is your **Telegram Chat ID**.
 
 ### 6. Run the Bot
