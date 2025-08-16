@@ -18,7 +18,11 @@ ALLOWED_ABILITIES_AND_SKILLS = (
 class PromptBuilder:
     """
     LLM prompt/call layer for the Dungeon Master game using the Responses API.
-    Strict JSON schema + retries + fallback model.
+    - Uses `instructions` for the system prompt (per SDK docs)
+    - Uses `input` with `input_text` parts (per SDK docs)
+    - No response_format / schema param (avoids SDK arg mismatches)
+    - Strict JSON via prompting + robust salvage parser
+    - Single fallback model
     """
 
     def __init__(self, gsm):
@@ -29,94 +33,138 @@ class PromptBuilder:
             raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---------- Helpers ----------
-    def _wrap_messages(self, messages):
-        """Wrap messages into Responses API format."""
-        return [
-            {
-                "role": m["role"],
-                "content": [{"type": "input_text", "text": m["content"]}],
-            }
-            for m in messages
-        ]
+    # ---------- Low-level helpers ----------
+    def _wrap_messages_for_responses(self, messages):
+        """
+        Convert chat-like messages into Responses API input.
+        - First system message -> instructions
+        - Remaining messages -> input with input_text parts
+        """
+        instructions = None
+        inputs = []
+        for m in messages:
+            role = m["role"]
+            content = m["content"]
+            if role == "system" and instructions is None:
+                instructions = content  # SDK supports top-level `instructions` with Responses
+                continue
+            inputs.append({
+                "role": role,
+                "content": [{"type": "input_text", "text": content}],
+            })
+        if instructions is None:
+            instructions = "You are a helpful assistant."
+        if not inputs:
+            # Ensure at least one user item
+            inputs.append({"role": "user", "content": [{"type": "input_text", "text": ""}]})
+        return instructions, inputs
 
-    def _responses(self, *, messages, json_schema: Optional[dict] = None,
-                   max_tokens: int = 1200, model: Optional[str] = None):
+    def _responses(self, *, messages, max_tokens: int = 1200, model: Optional[str] = None):
         mdl = model or PRIMARY_MODEL
-        params = {
-            "model": mdl,
-            "input": self._wrap_messages(messages),
-            "max_output_tokens": max_tokens,
-        }
-        if json_schema:
-            params["format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "dm_struct",
-                    "schema": json_schema,
-                },
-            }
-        return self.client.responses.create(**params)
+        instructions, input_payload = self._wrap_messages_for_responses(messages)
+        # Keep the call shape minimal & compatible with GPT-5 on latest SDK.
+        return self.client.responses.create(
+            model=mdl,
+            instructions=instructions,            # per SDK README
+            input=input_payload,                  # list of role items with input_text parts
+            max_output_tokens=max_tokens,         # correct knob for Responses API
+        )
 
     def _resp_text(self, resp) -> str:
-        """Extract plain text from Responses API output."""
-        text = getattr(resp, "output_text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
+        """
+        Extract text robustly from Responses API.
+        Prefer response.output_text; otherwise walk .output/.outputs.
+        """
+        txt = getattr(resp, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
 
         chunks = []
         try:
             output = getattr(resp, "output", None) or getattr(resp, "outputs", None)
             if output:
                 for item in output:
-                    for part in getattr(item, "content", []):
+                    parts = getattr(item, "content", None) or []
+                    for part in parts:
                         if getattr(part, "type", None) == "output_text":
-                            if isinstance(getattr(part, "text", None), str):
-                                chunks.append(part.text)
-                            elif hasattr(part, "text") and hasattr(part.text, "value"):
-                                chunks.append(part.text.value)
+                            # Some SDKs expose .text as str; others as object with .value
+                            t = getattr(part, "text", None)
+                            if isinstance(t, str):
+                                chunks.append(t)
+                            else:
+                                val = getattr(getattr(part, "text", None), "value", None)
+                                if val:
+                                    chunks.append(val)
         except Exception:
             pass
+
         return "".join(chunks).strip()
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
-        """Try to parse JSON, salvage if needed."""
-        text = (text or "").strip()
-        if not text:
+        """
+        Parse JSON; attempt to salvage the largest {...} block if needed.
+        """
+        t = (text or "").strip()
+        if not t:
             raise ValueError("empty content")
         try:
-            return json.loads(text)
+            return json.loads(t)
         except Exception:
-            start, end = text.find("{"), text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end+1])
+            s, e = t.find("{"), t.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                return json.loads(t[s:e+1])
             raise
 
     def _call_llm_json_core(self, system: str, user: str, model_override: Optional[str],
-                            max_tokens: int, schema: dict) -> Dict[str, Any]:
+                            max_tokens: int) -> Dict[str, Any]:
+        """
+        Single attempt: ask for STRICT JSON via prompt, then parse.
+        """
         resp = self._responses(
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            json_schema=schema,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             max_tokens=max_tokens,
             model=model_override,
         )
         text = self._resp_text(resp)
         return self._extract_json(text)
 
-    def _call_llm_json(self, system: str, user: str, max_tokens: int, schema: dict) -> Dict[str, Any]:
+    def _call_llm_json(self, system: str, user: str, max_tokens: int = 1200) -> Dict[str, Any]:
+        """
+        Primary -> fallback. If both fail, return a safe minimal scene.
+        """
         try:
-            return self._call_llm_json_core(system, user, None, max_tokens, schema)
+            return self._call_llm_json_core(system, user, None, max_tokens)
         except Exception as e:
             self.log.warning("Primary model %s failed: %s", PRIMARY_MODEL, e)
             if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
                 try:
-                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, max_tokens, schema)
+                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, max_tokens)
                 except Exception as e2:
                     self.log.error("Fallback %s also failed: %s", FALLBACK_MODEL, e2)
 
         return {"narrative": "The world blurs; reality resets. What do you do?", "choices": []}
 
     # ---------- Public builders ----------
+    def _schema_text_for_choices(self) -> str:
+        return (
+            '{ "narrative": string, '
+            '"choices": [ { "text": string, "dc": integer (5-25), '
+            f'"ability": one of [{ALLOWED_ABILITIES_AND_SKILLS}], '
+            '"tags": string[] } ] }'
+        )
+
+    def _schema_text_for_outcome(self) -> str:
+        return (
+            '{ "narrative": string, '
+            '"consequences": { "hp_delta": int, "xp_delta": int, '
+            '"items_gained": string[], "items_lost": string[], "milestone": boolean }, '
+            '"followup_choices": [ { "text": string, "dc": int (5-25), '
+            f'"ability": one of [{ALLOWED_ABILITIES_AND_SKILLS}], "tags": string[] } ] }}'
+        )
+
     def build_opening_scene(self) -> Dict[str, Any]:
         st = self.gsm.get_state()
         system = "You are a masterful, fair Dungeon Master for a Telegram text adventure."
@@ -127,34 +175,14 @@ class PromptBuilder:
             "xp": st.get("xp", 0),
             "summary": st.get("summary", ""),
         }
-        schema = {
-            "type": "object",
-            "properties": {
-                "narrative": {"type": "string"},
-                "choices": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "dc": {"type": "integer"},
-                            "ability": {"type": "string", "pattern": ALLOWED_ABILITIES_AND_SKILLS},
-                            "tags": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["text", "dc", "ability", "tags"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["narrative", "choices"],
-            "additionalProperties": False,
-        }
         user = (
-            "Begin the adventure with a vivid opening (4–8 sentences), establish tone, stakes, and a prompt to act.\n"
-            "Return STRICT JSON."
-            f"\n\nSTATE:\n{json.dumps(compact)}"
+            "Begin the adventure with a vivid opening (4–8 sentences). Establish tone, stakes, "
+            "and end with a natural prompt to act.\n\n"
+            "Return STRICT MINIFIED JSON ONLY (no prose, no code fences) matching:\n"
+            f"{self._schema_text_for_choices()}\n\n"
+            f"STATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, 1200, schema)
+        return self._call_llm_json(system, user, max_tokens=1200)
 
     def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -166,34 +194,15 @@ class PromptBuilder:
             "summary": st.get("summary", ""),
             "last_scene": st.get("last_scene", ""),
         }
-        schema = {
-            "type": "object",
-            "properties": {
-                "narrative": {"type": "string"},
-                "choices": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "dc": {"type": "integer"},
-                            "ability": {"type": "string", "pattern": ALLOWED_ABILITIES_AND_SKILLS},
-                            "tags": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["text", "dc", "ability", "tags"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["narrative", "choices"],
-            "additionalProperties": False,
-        }
         user = (
-            f"Continue the story. The player acted/said:\n{player_input}\n\n"
-            "Return STRICT JSON.\n"
+            "Continue the story based on the player's action below. Keep continuity tight. "
+            "Offer 2–4 sensible choices. Allow the player to go off-list.\n\n"
+            f"PLAYER ACTION: {player_input}\n\n"
+            "Return STRICT MINIFIED JSON ONLY (no prose, no code fences) matching:\n"
+            f"{self._schema_text_for_choices()}\n\n"
             f"STATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, 1200, schema)
+        return self._call_llm_json(system, user, max_tokens=1200)
 
     def build_outcome_prompt(self, choice: Dict[str, Any], roll: Dict[str, Any]) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -205,57 +214,33 @@ class PromptBuilder:
             "summary": st.get("summary", ""),
             "last_scene": st.get("last_scene", ""),
         }
-        schema = {
-            "type": "object",
-            "properties": {
-                "narrative": {"type": "string"},
-                "consequences": {
-                    "type": "object",
-                    "properties": {
-                        "hp_delta": {"type": "integer"},
-                        "xp_delta": {"type": "integer"},
-                        "items_gained": {"type": "array", "items": {"type": "string"}},
-                        "items_lost": {"type": "array", "items": {"type": "string"}},
-                        "milestone": {"type": "boolean"},
-                    },
-                    "required": ["hp_delta", "xp_delta", "items_gained", "items_lost", "milestone"],
-                    "additionalProperties": False,
-                },
-                "followup_choices": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "dc": {"type": "integer"},
-                            "ability": {"type": "string", "pattern": ALLOWED_ABILITIES_AND_SKILLS},
-                            "tags": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["text", "dc", "ability", "tags"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["narrative", "consequences", "followup_choices"],
-            "additionalProperties": False,
-        }
         user = (
-            f"Adjudicate the player's attempt.\nCHOICE: {json.dumps(choice)}\nROLL: {json.dumps(roll)}\n\n"
-            "Return STRICT JSON.\n"
+            "Adjudicate the player's attempt given CHOICE and ROLL. "
+            "Success yields greater progress and XP; failure yields setback and lesser XP "
+            "(rough guide: success ≈ DC*10 XP, failure ≈ DC*5 XP). Consider milestone for major beats.\n\n"
+            f"CHOICE: {json.dumps(choice)}\n"
+            f"ROLL: {json.dumps(roll)}\n\n"
+            "Return STRICT MINIFIED JSON ONLY (no prose, no code fences) matching:\n"
+            f"{self._schema_text_for_outcome()}\n\n"
             f"STATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, 1000, schema)
+        return self._call_llm_json(system, user, max_tokens=1000)
 
     def build_clarification_prompt(self, question: str) -> str:
         st = self.gsm.get_state()
         system = "You answer rules/lore questions succinctly (3–6 sentences)."
-        user = f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}"
+        user = (
+            "Answer the player's **out-of-game** question clearly and briefly. "
+            "If it's rules, be concrete; if world/lore, respect established facts.\n"
+            f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
+        )
         try:
             resp = self._responses(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 max_tokens=400,
             )
-            return self._resp_text(resp) or "I’ll answer as soon as I can—try again."
+            text = self._resp_text(resp)
+            return text or "I’ll answer as soon as I can—try again."
         except Exception:
             if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
                 resp2 = self._responses(
@@ -265,3 +250,4 @@ class PromptBuilder:
                 )
                 return self._resp_text(resp2) or "I’ll answer as soon as I can—try again."
             return "I’ll answer as soon as I can—try again."
+
