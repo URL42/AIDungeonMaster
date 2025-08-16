@@ -20,10 +20,10 @@ class PromptBuilder:
     """
     def __init__(self, gsm):
         self.gsm = gsm
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("DM_OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "OPENAI_API_KEY is not set. "
+                "DM_OPENAI_API_KEY is not set. "
                 "Put it in your environment or in a .env file next to dungeon_master.py."
             )
         self.client = OpenAI(api_key=api_key)
