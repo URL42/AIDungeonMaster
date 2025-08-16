@@ -147,7 +147,7 @@ class PromptBuilder:
         schema_hint = (
             '{ "narrative": string, '
             '"choices": [ { "text": string, "dc": integer (5-25), '
-            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] } ] }}'
+            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] }} ] }}'
         )
         user = (
             "Begin the adventure with a vivid opening (4–8 sentences). Establish tone, stakes, and end with a prompt to act.\n\n"
@@ -170,7 +170,7 @@ class PromptBuilder:
         schema_hint = (
             '{ "narrative": string, '
             '"choices": [ { "text": string, "dc": integer (5-25), '
-            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] } ] }}'
+            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] }} ] }}'
         )
         user = (
             "Continue the story based on the player's action below. Offer 2–4 sensible choices. Allow off-list actions.\n\n"
@@ -196,7 +196,7 @@ class PromptBuilder:
             '"consequences": { "hp_delta": int, "xp_delta": int, '
             '"items_gained": string[], "items_lost": string[], "milestone": boolean }, '
             '"followup_choices": [ { "text": string, "dc": int (5-25), '
-            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] } ] }}'
+            f'"ability": one of [{", ".join(ALLOWED_LIST)}], "tags": string[] }} ] }}'
         )
         user = (
             "Adjudicate the player's attempt given CHOICE and ROLL.\n"
