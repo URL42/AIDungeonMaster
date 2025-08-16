@@ -8,17 +8,86 @@ from openai import OpenAI
 PRIMARY_MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
 FALLBACK_MODEL = os.getenv("DM_FALLBACK_MODEL", "gpt-4o-mini")  # used ONLY if primary fails twice
 
-ALLOWED_ABILITIES_AND_SKILLS = (
-    "Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|"
-    "Perception|Stealth|Athletics|Arcana|History|Insight|Investigation|"
-    "Medicine|Nature|Religion|Animal Handling|Deception|Intimidation|"
-    "Performance|Persuasion"
-)
+ALLOWED = [
+    "Strength","Dexterity","Constitution","Intelligence","Wisdom","Charisma",
+    "Perception","Stealth","Athletics","Arcana","History","Insight","Investigation",
+    "Medicine","Nature","Religion","Animal Handling","Deception","Intimidation",
+    "Performance","Persuasion",
+]
+
+def opening_scene_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "narrative": {"type": "string"},
+            "choices": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "dc": {"type": "integer", "minimum": 5, "maximum": 25},
+                        "ability": {"type": "string", "enum": ALLOWED},
+                        "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                    },
+                    "required": ["text", "dc", "ability"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["narrative", "choices"],
+        "additionalProperties": False,
+    }
+
+def scene_schema() -> Dict[str, Any]:
+    # same shape as opening
+    return opening_scene_schema()
+
+def outcome_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "narrative": {"type": "string"},
+            "consequences": {
+                "type": "object",
+                "properties": {
+                    "hp_delta": {"type": "integer", "default": 0},
+                    "xp_delta": {"type": "integer", "default": 0},
+                    "items_gained": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "items_lost": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "milestone": {"type": "boolean", "default": False},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            "followup_choices": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "dc": {"type": "integer", "minimum": 5, "maximum": 25},
+                        "ability": {"type": "string", "enum": ALLOWED},
+                        "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                    },
+                    "required": ["text", "dc", "ability"],
+                    "additionalProperties": False,
+                },
+                "default": [],
+            },
+        },
+        "required": ["narrative","consequences","followup_choices"],
+        "additionalProperties": False,
+    }
 
 class PromptBuilder:
     """
-    LLM prompt/call layer for the Dungeon Master game using the Responses API.
-    Enforces strict JSON for scene/outcomes and has robust fallbacks.
+    LLM prompt/call layer for the Dungeon Master game using the Responses API + JSON Schema.
+    Guarantees a text output matching the schema so we don't get empty content.
     """
     def __init__(self, gsm):
         self.gsm = gsm
@@ -28,81 +97,85 @@ class PromptBuilder:
             raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---------- Low-level Responses API helpers ----------
-    def _responses(self, *, messages, response_format: Optional[dict] = None,
+    # ---------- Responses API helpers ----------
+    def _responses(self, *, input_payload, json_schema: Optional[Dict[str, Any]] = None,
                    max_tokens: int = 1200, model: Optional[str] = None):
         """
-        Call OpenAI Responses API. We avoid custom temperatures because some GPT-5
-        variants only allow the default. Use max_output_tokens per API.
+        Call OpenAI Responses API with canonical 'input', JSON Schema (strict) for structured text output,
+        and GPT-5-friendly knobs for less invisible reasoning.
         """
         mdl = model or PRIMARY_MODEL
         params = {
             "model": mdl,
-            # Responses API accepts "input" for simple strings OR chat-style "messages".
-            # We send messages to preserve roles/system prompts.
-            "messages": messages,
-            "max_output_tokens": max_tokens,
+            "input": input_payload,               # canonical key for Responses API
+            "max_output_tokens": max_tokens,      # correct knob for Responses
+            "verbosity": "low",                   # GPT-5: keep it tight
+            "reasoning": {"effort": "minimal"},   # GPT-5: avoid long hidden reasoning-only outputs
         }
-        if response_format:
-            params["response_format"] = response_format
+        if json_schema:
+            params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "dm_struct",
+                    "schema": json_schema,
+                    "strict": True,
+                }
+            }
+        # Do NOT send temperature unless you truly need it; some 5-series force default only
         return self.client.responses.create(**params)
 
     def _resp_text(self, resp) -> str:
         """
-        Extract text from various Responses API SDK shapes.
-        Prefer resp.output_text when available; otherwise walk .output[].content[].
+        Extract text robustly. Prefer response.output_text; otherwise walk outputs.
         """
-        # Newer SDKs provide a convenience
-        text = getattr(resp, "output_text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
+        txt = getattr(resp, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
         chunks = []
         try:
             output = getattr(resp, "output", None) or getattr(resp, "outputs", None)
             if output:
                 for item in output:
-                    # Each item typically has .content (list of parts)
                     parts = getattr(item, "content", None)
                     if not parts:
                         continue
                     for part in parts:
-                        # part could have .type == "output_text" and .text.value
-                        ptype = getattr(part, "type", None)
-                        if ptype == "output_text":
-                            t = getattr(getattr(part, "text", None), "value", None)
-                            if t:
-                                chunks.append(t)
-                        # fallback: some SDKs expose .text directly as str
-                        t2 = getattr(part, "text", None)
-                        if isinstance(t2, str) and t2:
-                            chunks.append(t2)
+                        if getattr(part, "type", None) == "output_text":
+                            val = getattr(getattr(part, "text", None), "value", None)
+                            if val:
+                                chunks.append(val)
+                        else:
+                            # Some SDKs expose part.text as a raw string
+                            t2 = getattr(part, "text", None)
+                            if isinstance(t2, str) and t2:
+                                chunks.append(t2)
         except Exception:
             pass
+        return "".join(chunks).strip()
 
-        combined = "".join(chunks).strip()
-        return combined
-
-    # ---------- JSON call with salvage, retry, and model fallback ----------
+    # ---------- JSON call with retry + fallback ----------
     def _extract_json(self, text: str) -> Dict[str, Any]:
-        text = (text or "").strip()
-        if not text:
+        t = (text or "").strip()
+        if not t:
             raise ValueError("empty content")
         try:
-            return json.loads(text)
+            return json.loads(t)
         except Exception:
             # salvage {...}
-            start, end = text.find("{"), text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end+1])
+            s, e = t.find("{"), t.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                return json.loads(t[s:e+1])
             raise
 
     def _call_llm_json_core(self, system: str, user: str, model_override: Optional[str],
-                            max_tokens: int) -> Dict[str, Any]:
-        # Attempt 1: JSON mode
+                            schema: Dict[str, Any], max_tokens: int) -> Dict[str, Any]:
+        # Attempt 1: strict JSON Schema
         resp = self._responses(
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
+            input_payload=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            json_schema=schema,
             max_tokens=max_tokens,
             model=model_override,
         )
@@ -113,11 +186,14 @@ class PromptBuilder:
             self.log.warning("JSON parse failed (attempt 1, model=%s). Raw (first 500): %r",
                              model_override or PRIMARY_MODEL, (text or "")[:500])
 
-        # Attempt 2: stricter instruction, no response_format (some variants can be picky)
-        strict_user = user + "\nIMPORTANT: Return ONLY valid minified JSON per the schema. No commentary, no code fences."
+        # Attempt 2: re-ask with an explicit reminder (schema still enforced)
+        strict_user = user + " Return ONLY minified JSON adhering to the schema. No prose."
         resp2 = self._responses(
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": strict_user}],
-            response_format=None,
+            input_payload=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": strict_user},
+            ],
+            json_schema=schema,
             max_tokens=max_tokens,
             model=model_override,
         )
@@ -129,22 +205,17 @@ class PromptBuilder:
                            model_override or PRIMARY_MODEL, (text2 or "")[:500])
             raise ValueError("unparseable")
 
-    def _call_llm_json(self, system: str, user: str, max_tokens: int = 1200) -> Dict[str, Any]:
-        """
-        Try primary model first; if both passes fail (empty/non-JSON) switch to fallback model once.
-        If everything fails, return a safe minimal scene so the game continues.
-        """
+    def _call_llm_json(self, system: str, user: str, schema: Dict[str, Any], max_tokens: int = 1200) -> Dict[str, Any]:
         try:
-            return self._call_llm_json_core(system, user, None, max_tokens)
+            return self._call_llm_json_core(system, user, None, schema, max_tokens)
         except Exception:
             if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
                 self.log.warning("Falling back to %s after primary model returned empty/unparseable output.",
                                  FALLBACK_MODEL)
                 try:
-                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, max_tokens)
+                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, schema, max_tokens)
                 except Exception:
                     pass
-
         # Final safety
         return {
             "narrative": "The wind shifts; the world feels momentarily out of focus. Regain your bearings—what do you do?",
@@ -164,15 +235,12 @@ class PromptBuilder:
         }
         user = (
             "Begin the adventure with a vivid opening (4–8 sentences), establish tone, stakes, and a prompt to act.\n"
-            "Return STRICT JSON (no code fences):\n"
-            "{\n"
-            '  "narrative": "string",\n'
-            f'  "choices": [ {{"text":"string","dc": int, "ability": "{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
-            "}\n"
-            "2–4 choices. Each must include a relevant ability or skill."
+            "Return JSON with:\n"
+            '{ "narrative": string, "choices": [ { "text": string, "dc": int, "ability": enum, "tags": [] } ] }\n'
+            "2–4 choices; each includes a relevant ability or skill."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, max_tokens=1200)
+        return self._call_llm_json(system, user, opening_scene_schema(), max_tokens=1200)
 
     def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -185,17 +253,14 @@ class PromptBuilder:
             "last_scene": st.get("last_scene", ""),
         }
         user = (
-            "Continue the story. The player acted/said:\n"
+            "Continue the story based on the player's action:\n"
             f"{player_input}\n\n"
-            "Return STRICT JSON (no code fences):\n"
-            "{\n"
-            '  "narrative": "string",\n'
-            f'  "choices": [ {{"text":"string","dc": int, "ability": "{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
-            "}\n"
-            "Allow the player to go off-list; remain coherent and responsive."
+            "Return JSON with:\n"
+            '{ "narrative": string, "choices": [ { "text": string, "dc": int, "ability": enum, "tags": [] } ] }'
+            "\nAllow off-list actions; remain coherent and responsive."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, max_tokens=1200)
+        return self._call_llm_json(system, user, scene_schema(), max_tokens=1200)
 
     def build_outcome_prompt(self, choice: Dict[str, Any], roll: Dict[str, Any]) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -211,16 +276,13 @@ class PromptBuilder:
             "Adjudicate the player's attempt.\n"
             f"CHOICE: {json.dumps(choice)}\n"
             f"ROLL: {json.dumps(roll)}\n\n"
-            "Return STRICT JSON (no code fences):\n"
-            "{\n"
-            '  "narrative": "string",\n'
-            '  "consequences": {"hp_delta": 0, "xp_delta": 0, "items_gained": [], "items_lost": [], "milestone": false},\n'
-            f'  "followup_choices": [ {{"text":"string","dc": int, "ability":"{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
-            "}\n"
+            "Return JSON with:\n"
+            '{ "narrative": string, "consequences": {"hp_delta": int, "xp_delta": int, "items_gained": [], '
+            '"items_lost": [], "milestone": bool}, "followup_choices": [ { "text": string, "dc": int, "ability": enum, "tags": [] } ] }\n'
             "XP guidance: success ≈ DC*10, failure ≈ DC*5. Consider milestone for major beats."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, max_tokens=1000)
+        return self._call_llm_json(system, user, outcome_schema(), max_tokens=1000)
 
     def build_clarification_prompt(self, question: str) -> str:
         st = self.gsm.get_state()
@@ -230,27 +292,22 @@ class PromptBuilder:
             "If it's rules, be concrete; if world/lore, respect established facts.\n"
             f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
         )
-        # No response_format here—plain text answer
-        try:
-            resp = self._responses(
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                response_format=None,
-                max_tokens=400,
-                model=None,
+        # No JSON schema here—plain text
+        resp = self._responses(
+            input_payload=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            json_schema=None,
+            max_tokens=400,
+            model=None,
+        )
+        text = self._resp_text(resp)
+        if text:
+            return text
+        # fallback
+        if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
+            self.log.warning("Falling back to %s for /ask.", FALLBACK_MODEL)
+            resp2 = self._responses(
+                input_payload=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                json_schema=None, max_tokens=400, model=FALLBACK_MODEL,
             )
-            text = self._resp_text(resp)
-            if text:
-                return text
-            raise ValueError("empty")
-        except Exception:
-            if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
-                self.log.warning("Falling back to %s for /ask.", FALLBACK_MODEL)
-                resp2 = self._responses(
-                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    response_format=None,
-                    max_tokens=400,
-                    model=FALLBACK_MODEL,
-                )
-                return self._resp_text(resp2) or "I’ll answer as soon as I can—try again."
-            return "I’ll answer as soon as I can—try again."
-
+            return self._resp_text(resp2) or "I’ll answer as soon as I can—try again."
+        return "I’ll answer as soon as I can—try again."
