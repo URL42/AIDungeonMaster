@@ -31,14 +31,14 @@ class PromptBuilder:
 
     # ---------- Helpers ----------
     def _wrap_messages(self, messages):
-        """Wraps content into the Responses API format: list of parts."""
-        wrapped = []
-        for m in messages:
-            wrapped.append({
+        """Wrap messages into Responses API format."""
+        return [
+            {
                 "role": m["role"],
                 "content": [{"type": "input_text", "text": m["content"]}],
-            })
-        return wrapped
+            }
+            for m in messages
+        ]
 
     def _responses(self, *, messages, json_schema: Optional[dict] = None,
                    max_tokens: int = 1200, model: Optional[str] = None):
@@ -54,17 +54,16 @@ class PromptBuilder:
                 "json_schema": {
                     "name": "dm_struct",
                     "schema": json_schema,
-                }
+                },
             }
         return self.client.responses.create(**params)
 
     def _resp_text(self, resp) -> str:
-        # Try .output_text if available
+        """Extract plain text from Responses API output."""
         text = getattr(resp, "output_text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
 
-        # Otherwise, manually extract
         chunks = []
         try:
             output = getattr(resp, "output", None) or getattr(resp, "outputs", None)
@@ -72,24 +71,22 @@ class PromptBuilder:
                 for item in output:
                     for part in getattr(item, "content", []):
                         if getattr(part, "type", None) == "output_text":
-                            val = getattr(getattr(part, "text", None), "value", None)
-                            if val:
-                                chunks.append(val)
-                        elif isinstance(getattr(part, "text", None), str):
-                            chunks.append(part.text)
+                            if isinstance(getattr(part, "text", None), str):
+                                chunks.append(part.text)
+                            elif hasattr(part, "text") and hasattr(part.text, "value"):
+                                chunks.append(part.text.value)
         except Exception:
             pass
-
         return "".join(chunks).strip()
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
+        """Try to parse JSON, salvage if needed."""
         text = (text or "").strip()
         if not text:
             raise ValueError("empty content")
         try:
             return json.loads(text)
         except Exception:
-            # salvage {...}
             start, end = text.find("{"), text.rfind("}")
             if start != -1 and end != -1 and end > start:
                 return json.loads(text[start:end+1])
@@ -117,7 +114,6 @@ class PromptBuilder:
                 except Exception as e2:
                     self.log.error("Fallback %s also failed: %s", FALLBACK_MODEL, e2)
 
-        # safety
         return {"narrative": "The world blurs; reality resets. What do you do?", "choices": []}
 
     # ---------- Public builders ----------
