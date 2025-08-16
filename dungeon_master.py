@@ -1,13 +1,12 @@
-# dungeon_master2.py
-import asyncio
+# dungeon_master.py
 import json
 import logging
 import os
 import random
 import secrets
 import time
-from typing import Dict, Any, List
 from pathlib import Path
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -22,13 +21,18 @@ from persistence import (
 )
 from prompt_builder import PromptBuilder
 
-# ---------- Setup ----------
-load_dotenv()
-logger = setup_logger()
+# ---------- Env & setup ----------
+load_dotenv()  # load .env from working dir
 
 TELEGRAM_BOT_TOKEN = os.getenv("DM_TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("DM_TELEGRAM_BOT_TOKEN not set")
+    raise RuntimeError("DM_TELEGRAM_BOT_TOKEN not set (env or .env).")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set (env or .env).")
+
+logger = setup_logger()
 
 # Conversation states
 CHOOSING_GENRE, CHOOSING_CLASS, ENTERING_NAME, ENTERING_MOTIVATION, IN_GAME = range(5)
@@ -50,7 +54,7 @@ def make_menu() -> List[BotCommand]:
         BotCommand("load", "Load last save"),
         BotCommand("restore", "Restore from backup"),
         BotCommand("xp", "XP & Level"),
-        BotCommand("rest", "Take a long rest (heal)"),
+        BotCommand("rest", "Long rest (heal)"),
         BotCommand("rollmode", "Set roll mode (normal/adv/dis)"),
         BotCommand("reset", "Hard reset"),
     ]
@@ -73,6 +77,18 @@ def class_kit_for(rc_lower: str) -> List[str]:
 
 def rollmode_label(mode: str) -> str:
     return {"normal":"Normal", "advantage":"Advantage", "disadvantage":"Disadvantage"}.get(mode, "Normal")
+
+# ---------- Error handler ----------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception: %s", context.error)
+    try:
+        if hasattr(context, "bot") and update and getattr(update, "effective_chat", None):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Oops—something went wrong. I logged it."
+            )
+    except Exception:
+        pass
 
 # ---------- Command Handlers ----------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,7 +187,7 @@ async def on_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kit = class_kit_for(rc)
     gsm.state["inventory"] = list({*gsm.state.get("inventory", []), *kit})
 
-    # Ability score generation per user preference: d20 for each stat (3–20 cap via randint)
+    # Ability score generation per your preference: d20 for each stat (3–20 cap)
     rolls = {k: random.randint(3,20) for k in ["STR","DEX","CON","INT","WIS","CHA"]}
     gsm.state["character"]["abilities"] = rolls
     # HP = 8 + CON mod
@@ -389,7 +405,7 @@ async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gsm = user_gsm(update)
-    import glob, os
+    import glob
     backups = sorted(glob.glob(f"saves/{gsm.user_id}.*.bak.json"))
     if not backups:
         await update.message.reply_text("No backups found.")
@@ -449,8 +465,12 @@ def main():
 
     app.add_handler(conv)
 
+    # Error handler
+    app.add_error_handler(on_error)
+
     logger.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
