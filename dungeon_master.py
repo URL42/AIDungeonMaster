@@ -19,9 +19,9 @@ from telegram.ext import (
 from persistence import GameStateManager, logger as app_logger
 from prompt_builder import PromptBuilder
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("DM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN) in your environment/.env")
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN) (or DM_BOT_TOKEN) in your environment/.env")
 
 log = app_logger  # re-use same logger
 
