@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 from openai import OpenAI
 
 PRIMARY_MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
-FALLBACK_MODEL = os.getenv("DM_FALLBACK_MODEL", "gpt-4o-mini")  # used ONLY if primary returns empty twice
+FALLBACK_MODEL = os.getenv("DM_FALLBACK_MODEL", "gpt-4o-mini")  # used ONLY if primary fails twice
 
 ALLOWED_ABILITIES_AND_SKILLS = (
     "Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|"
@@ -16,6 +16,10 @@ ALLOWED_ABILITIES_AND_SKILLS = (
 )
 
 class PromptBuilder:
+    """
+    LLM prompt/call layer for the Dungeon Master game using the Responses API.
+    Enforces strict JSON for scene/outcomes and has robust fallbacks.
+    """
     def __init__(self, gsm):
         self.gsm = gsm
         self.log = logging.getLogger("dm_bot")
@@ -24,57 +28,62 @@ class PromptBuilder:
             raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---- GPT-5-safe chat wrapper with param fallbacks ----
-    def _chat(self, *, messages, response_format=None, temperature: Optional[float]=None,
-              max_tokens=1200, model: Optional[str]=None):
+    # ---------- Low-level Responses API helpers ----------
+    def _responses(self, *, messages, response_format: Optional[dict] = None,
+                   max_tokens: int = 1200, model: Optional[str] = None):
         """
-        Try GPT-5-style params first; on specific errors, retry with compatible params.
-        Works with both 5-series (max_completion_tokens) and older models (max_tokens).
+        Call OpenAI Responses API. We avoid custom temperatures because some GPT-5
+        variants only allow the default. Use max_output_tokens per API.
         """
         mdl = model or PRIMARY_MODEL
         params = {
             "model": mdl,
+            # Responses API accepts "input" for simple strings OR chat-style "messages".
+            # We send messages to preserve roles/system prompts.
             "messages": messages,
-            "max_completion_tokens": max_tokens,  # GPT-5 & reasoning variants
+            "max_output_tokens": max_tokens,
         }
         if response_format:
             params["response_format"] = response_format
-        if temperature is not None:
-            params["temperature"] = temperature
+        return self.client.responses.create(**params)
 
-        def do_call(p):
-            return self.client.chat.completions.create(**p)
+    def _resp_text(self, resp) -> str:
+        """
+        Extract text from various Responses API SDK shapes.
+        Prefer resp.output_text when available; otherwise walk .output[].content[].
+        """
+        # Newer SDKs provide a convenience
+        text = getattr(resp, "output_text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
 
+        chunks = []
         try:
-            return do_call(params)
-        except Exception as e:
-            msg = str(e)
+            output = getattr(resp, "output", None) or getattr(resp, "outputs", None)
+            if output:
+                for item in output:
+                    # Each item typically has .content (list of parts)
+                    parts = getattr(item, "content", None)
+                    if not parts:
+                        continue
+                    for part in parts:
+                        # part could have .type == "output_text" and .text.value
+                        ptype = getattr(part, "type", None)
+                        if ptype == "output_text":
+                            t = getattr(getattr(part, "text", None), "value", None)
+                            if t:
+                                chunks.append(t)
+                        # fallback: some SDKs expose .text directly as str
+                        t2 = getattr(part, "text", None)
+                        if isinstance(t2, str) and t2:
+                            chunks.append(t2)
+        except Exception:
+            pass
 
-            # Some 5-series reject any non-default temperature
-            if "temperature" in msg and ("Unsupported parameter" in msg or "Unsupported value" in msg or "Only the default" in msg):
-                params.pop("temperature", None)
-                try:
-                    return do_call(params)
-                except Exception as e2:
-                    msg = str(e2)
+        combined = "".join(chunks).strip()
+        return combined
 
-            # Older chat models want max_tokens instead
-            if "max_completion_tokens" in msg and ("Unsupported parameter" in msg or "Unrecognized request argument" in msg):
-                params.pop("max_completion_tokens", None)
-                params["max_tokens"] = max_tokens
-                try:
-                    return do_call(params)
-                except Exception as e3:
-                    msg = str(e3)
-
-            # Some variants may not support response_format
-            if "response_format" in msg and "Unsupported parameter" in msg:
-                params.pop("response_format", None)
-                return do_call(params)
-
-            raise
-
-    # ---- Robust JSON helpers ----
+    # ---------- JSON call with salvage, retry, and model fallback ----------
     def _extract_json(self, text: str) -> Dict[str, Any]:
         text = (text or "").strip()
         if not text:
@@ -82,68 +91,67 @@ class PromptBuilder:
         try:
             return json.loads(text)
         except Exception:
+            # salvage {...}
             start, end = text.find("{"), text.rfind("}")
             if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end + 1])
+                return json.loads(text[start:end+1])
             raise
 
     def _call_llm_json_core(self, system: str, user: str, model_override: Optional[str],
-                            temperature: Optional[float], max_tokens: int) -> Dict[str, Any]:
+                            max_tokens: int) -> Dict[str, Any]:
         # Attempt 1: JSON mode
-        resp = self._chat(
+        resp = self._responses(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
-            temperature=temperature,
             max_tokens=max_tokens,
             model=model_override,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        text = self._resp_text(resp)
         try:
             return self._extract_json(text)
         except Exception:
             self.log.warning("JSON parse failed (attempt 1, model=%s). Raw (first 500): %r",
-                             model_override or PRIMARY_MODEL, text[:500])
+                             model_override or PRIMARY_MODEL, (text or "")[:500])
 
-        # Attempt 2: stricter instruction, no response_format, default temperature
+        # Attempt 2: stricter instruction, no response_format (some variants can be picky)
         strict_user = user + "\nIMPORTANT: Return ONLY valid minified JSON per the schema. No commentary, no code fences."
-        resp2 = self._chat(
+        resp2 = self._responses(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": strict_user}],
-            temperature=None,  # drop temp to satisfy models that only support default
+            response_format=None,
             max_tokens=max_tokens,
             model=model_override,
         )
-        text2 = (resp2.choices[0].message.content or "").strip()
+        text2 = self._resp_text(resp2)
         try:
             return self._extract_json(text2)
         except Exception:
             self.log.error("JSON parse failed (attempt 2, model=%s). Raw (first 500): %r",
-                           model_override or PRIMARY_MODEL, text2[:500])
+                           model_override or PRIMARY_MODEL, (text2 or "")[:500])
             raise ValueError("unparseable")
 
-    def _call_llm_json(self, system: str, user: str, temperature: Optional[float] = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+    def _call_llm_json(self, system: str, user: str, max_tokens: int = 1200) -> Dict[str, Any]:
         """
-        Try primary model; if both passes fail (empty/non-JSON), try fallback model once.
-        If everything fails, return a safe minimal scene.
+        Try primary model first; if both passes fail (empty/non-JSON) switch to fallback model once.
+        If everything fails, return a safe minimal scene so the game continues.
         """
         try:
-            return self._call_llm_json_core(system, user, None, temperature, max_tokens)
+            return self._call_llm_json_core(system, user, None, max_tokens)
         except Exception:
-            # Fallback model (only if configured and different)
             if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
                 self.log.warning("Falling back to %s after primary model returned empty/unparseable output.",
                                  FALLBACK_MODEL)
                 try:
-                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, temperature, max_tokens)
+                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, max_tokens)
                 except Exception:
                     pass
 
-        # Final safety: keep the game moving
+        # Final safety
         return {
             "narrative": "The wind shifts; the world feels momentarily out of focus. Regain your bearings—what do you do?",
             "choices": []
         }
 
-    # ---------- Prompts ----------
+    # ---------- Public builders ----------
     def build_opening_scene(self) -> Dict[str, Any]:
         st = self.gsm.get_state()
         system = "You are a masterful, fair Dungeon Master for a Telegram text adventure."
@@ -164,7 +172,7 @@ class PromptBuilder:
             "2–4 choices. Each must include a relevant ability or skill."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, temperature=0.8)
+        return self._call_llm_json(system, user, max_tokens=1200)
 
     def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -187,7 +195,7 @@ class PromptBuilder:
             "Allow the player to go off-list; remain coherent and responsive."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, temperature=0.8)
+        return self._call_llm_json(system, user, max_tokens=1200)
 
     def build_outcome_prompt(self, choice: Dict[str, Any], roll: Dict[str, Any]) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -212,7 +220,7 @@ class PromptBuilder:
             "XP guidance: success ≈ DC*10, failure ≈ DC*5. Consider milestone for major beats."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user, temperature=0.7)
+        return self._call_llm_json(system, user, max_tokens=1000)
 
     def build_clarification_prompt(self, question: str) -> str:
         st = self.gsm.get_state()
@@ -222,25 +230,26 @@ class PromptBuilder:
             "If it's rules, be concrete; if world/lore, respect established facts.\n"
             f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
         )
-        # Text path (with same guardrails and fallback if needed)
+        # No response_format here—plain text answer
         try:
-            resp = self._chat(
+            resp = self._responses(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0.4,
+                response_format=None,
                 max_tokens=400,
+                model=None,
             )
-            text = (resp.choices[0].message.content or "").strip()
-            if not text:
-                raise ValueError("empty")
-            return text
+            text = self._resp_text(resp)
+            if text:
+                return text
+            raise ValueError("empty")
         except Exception:
             if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
                 self.log.warning("Falling back to %s for /ask.", FALLBACK_MODEL)
-                resp2 = self._chat(
+                resp2 = self._responses(
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    temperature=None,
+                    response_format=None,
                     max_tokens=400,
                     model=FALLBACK_MODEL,
                 )
-                return (resp2.choices[0].message.content or "").strip()
-            return "I'll answer briefly once I get my bearings—try again in a moment."
+                return self._resp_text(resp2) or "I’ll answer as soon as I can—try again."
+            return "I’ll answer as soon as I can—try again."
