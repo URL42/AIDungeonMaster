@@ -21,44 +21,64 @@ class PromptBuilder:
             raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---------- low-level wrapper that is GPT-5 safe ----------
+    # ---- GPT-5 safe chat wrapper ----
     def _chat(self, *, messages, response_format=None, temperature=None, max_tokens=1200):
         """
-        Try GPT-5-style params first (max_completion_tokens). If the model rejects
-        temperature or token param, transparently retry with compatible settings.
+        Try GPT-5-style params first. On specific errors, retry with compatible params.
         """
         params = {
             "model": MODEL,
             "messages": messages,
-            "max_completion_tokens": max_tokens,  # GPT-5 & reasoning models
+            "max_completion_tokens": max_tokens,  # GPT-5 & reasoning variants
         }
         if response_format:
             params["response_format"] = response_format
         if temperature is not None:
             params["temperature"] = temperature
 
+        def do_call(p):
+            return self.client.chat.completions.create(**p)
+
         try:
-            return self.client.chat.completions.create(**params)
+            return do_call(params)
         except Exception as e:
             msg = str(e)
-            # Some GPT-5 variants may reject temperature
-            if "Unsupported parameter: 'temperature'" in msg:
+
+            # Some 5-series reject any non-default temperature
+            if "temperature" in msg and ("Unsupported parameter" in msg or "Unsupported value" in msg or "Only the default" in msg):
                 params.pop("temperature", None)
-                return self.client.chat.completions.create(**params)
-            # Older models expect max_tokens
-            if "Unsupported parameter: 'max_completion_tokens'" in msg:
+                try:
+                    return do_call(params)
+                except Exception as e2:
+                    msg = str(e2)
+
+            # Older chat models want max_tokens, not max_completion_tokens
+            if "max_completion_tokens" in msg and ("Unsupported parameter" in msg or "Unrecognized request argument" in msg):
                 params.pop("max_completion_tokens", None)
                 params["max_tokens"] = max_tokens
-                return self.client.chat.completions.create(**params)
-            # Rare: some gateways still want max_tokens AND reject temperature
-            if "Unrecognized request argument" in msg and "max_completion_tokens" in msg:
-                params.pop("max_completion_tokens", None)
-                params["max_tokens"] = max_tokens
-                params.pop("temperature", None)
-                return self.client.chat.completions.create(**params)
+                try:
+                    return do_call(params)
+                except Exception as e3:
+                    msg = str(e3)
+
+            # If we started with max_tokens (older path) but model wants max_completion_tokens
+            if "max_tokens" in msg and "Use 'max_completion_tokens' instead" in msg:
+                params.pop("max_tokens", None)
+                params["max_completion_tokens"] = max_tokens
+                try:
+                    return do_call(params)
+                except Exception as e4:
+                    msg = str(e4)
+
+            # Some variants may not support response_format
+            if "response_format" in msg and "Unsupported parameter" in msg:
+                params.pop("response_format", None)
+                return do_call(params)
+
+            # If we reach here, bubble up the original error
             raise
 
-    def _call_llm_json(self, system: str, user: str, temperature: float = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+    def _call_llm_json(self, system: str, user: str, temperature: float | None = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
         resp = self._chat(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
@@ -95,7 +115,8 @@ class PromptBuilder:
             "2–4 choices. Each must include a relevant ability or skill."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user)
+        # temperature will be dropped automatically if the model forbids it
+        return self._call_llm_json(system, user, temperature=0.8)
 
     def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -118,7 +139,7 @@ class PromptBuilder:
             "Allow the player to go off-list; remain coherent and responsive."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        return self._call_llm_json(system, user)
+        return self._call_llm_json(system, user, temperature=0.8)
 
     def build_outcome_prompt(self, choice: Dict[str, Any], roll: Dict[str, Any]) -> Dict[str, Any]:
         st = self.gsm.get_state()
@@ -159,5 +180,3 @@ class PromptBuilder:
             max_tokens=400,
         )
         return resp.choices[0].message.content.strip()
-
-
