@@ -1,525 +1,456 @@
-import logging
+# dungeon_master2.py
+import asyncio
 import json
-import random
+import logging
 import os
-import warnings
-import re
-import datetime
+import random
+import secrets
+import time
+from typing import Dict, Any, List
+from pathlib import Path
+
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
 )
-from telegram.warnings import PTBUserWarning
-from openai import OpenAI
-from dotenv import load_dotenv
-from prompt_builder import PromptBuilder
-from persistence import GameStateManager
-from persistence import GameStateManager, setup_logger
 
-# Setup logging path
-os.makedirs("logs", exist_ok=True)
-LOG_FILE = "logs/game_debug.log"
+from persistence import (
+    GameStateManager, TelegramJSONPersistence, setup_logger,
+    ability_mod, proficiency_bonus
+)
+from prompt_builder import PromptBuilder
+
+# ---------- Setup ----------
+load_dotenv()
 logger = setup_logger()
 
-DEBUG_MODE = True
-warnings.filterwarnings("ignore", category=UserWarning, module="telegram.ext._application")
-warnings.filterwarnings("ignore", category=PTBUserWarning, message=r".*per_message=False.*")
-
-# Load environment
-load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("DM_TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("DM_OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("DM_TELEGRAM_BOT_TOKEN not set")
 
-CHOOSING_GENRE, CHOOSING_RACE_CLASS, CHOOSING_NAME, CHOOSING_MOTIVATION, \
-GAME_LOOP, HANDLING_CHOICE, AWAITING_ROLL, WAITING_ITEM = range(8)
+# Conversation states
+CHOOSING_GENRE, CHOOSING_CLASS, ENTERING_NAME, ENTERING_MOTIVATION, IN_GAME = range(5)
 
-def calculate_modifier(score: int) -> int:
-    mod = (score - 10) // 2
-    logger.debug(f"🧮 Modifier for score {score}: {mod}")
-    return mod
+# ---------- Helpers ----------
+def user_gsm(update: Update) -> GameStateManager:
+    uid = update.effective_user.id
+    return GameStateManager(uid)
 
-async def generate_gpt_response(prompt: str) -> str:
-    try:
-        logger.info(f"🧠 GPT Prompt:\n{prompt}")
-        resp = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a creative Dungeon Master."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.85,
-            max_tokens=1000
-        )
-        text = resp.choices[0].message.content.strip()
-        logger.info(f"📜 GPT Reply:\n{text}")
-        return text
-    except Exception as e:
-        logger.error(f"GPT error: {e}")
-        return "⚠️ The story momentarily clears..."
+def make_menu() -> List[BotCommand]:
+    return [
+        BotCommand("start", "Start / restart"),
+        BotCommand("help", "Show commands"),
+        BotCommand("sheet", "Character sheet"),
+        BotCommand("inventory", "Inventory"),
+        BotCommand("ask", "Out-of-game question"),
+        BotCommand("story", "Show last scene"),
+        BotCommand("save", "Save game"),
+        BotCommand("load", "Load last save"),
+        BotCommand("restore", "Restore from backup"),
+        BotCommand("xp", "XP & Level"),
+        BotCommand("rest", "Take a long rest (heal)"),
+        BotCommand("rollmode", "Set roll mode (normal/adv/dis)"),
+        BotCommand("reset", "Hard reset"),
+    ]
 
-def init_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> GameStateManager:
-    user_id = str(update.effective_user.id)
-    gsm = GameStateManager(user_id)
-    context.user_data["gsm"] = gsm
-    context.user_data["prompt_builder"] = PromptBuilder(gsm)
-    return gsm
+def abilities_block(abilities: Dict[str, int]) -> str:
+    rows = []
+    for k in ["STR","DEX","CON","INT","WIS","CHA"]:
+        v = abilities.get(k,10)
+        rows.append(f"{k}: {v} (mod {ability_mod(v):+d})")
+    return "\n".join(rows)
+
+def class_kit_for(rc_lower: str) -> List[str]:
+    if "rogue" in rc_lower:
+        return ["Shortsword", "Dagger", "Thieves' Tools", "Cloak"]
+    if "fighter" in rc_lower or "barbarian" in rc_lower:
+        return ["Longsword", "Shield", "Chain Shirt", "Traveler's Pack"]
+    if "cleric" in rc_lower:
+        return ["Mace", "Wooden Shield", "Holy Symbol", "Healer's Kit"]
+    return ["Traveler's Cloak", "Waterskin", "Rations (3 days)"]
+
+def rollmode_label(mode: str) -> str:
+    return {"normal":"Normal", "advantage":"Advantage", "disadvantage":"Disadvantage"}.get(mode, "Normal")
+
+# ---------- Command Handlers ----------
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "*Commands*\n"
+        "/start — Start/restart the game\n"
+        "/sheet — Show your character sheet\n"
+        "/inventory — Show inventory\n"
+        "/story — Show last scene\n"
+        "/ask <question> — Ask out-of-game question\n"
+        "/save, /load, /restore — Manage saves\n"
+        "/xp — Show XP & Level\n"
+        "/rest — Long rest (heal to max)\n"
+        "/rollmode — Set roll mode: normal, adv, dis\n"
+        "/reset — Reset game file\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        logger.debug(f"/start by {update.effective_user.id}")
-        gsm = init_state(update, context)
-        if gsm.state.get("character", {}).get("name"):
-            await update.message.reply_text("Welcome back! Use /story to continue.")
-            return GAME_LOOP
-        else:
-            await update.message.reply_text(
-                "Choose your story genre:\n(e.g: Fantasy/Sci-Fi/Noir/Steampunk)"
-            )
-            return CHOOSING_GENRE
-    except Exception as e:
-        logging.error(f"Start error: {e}")
-        await update.message.reply_text("⚠️ Failed to initialize. Try /start again.")
-        return ConversationHandler.END
+    await context.bot.set_my_commands(make_menu())
+    gsm = user_gsm(update)
+    # Reset state to defaults but preserve file structure
+    gsm.state = json.loads(json.dumps(gsm.state))
+    gsm.state.update({
+        "character": {
+            "name":"", "race_class":"", "motivation":"",
+            "abilities":{"STR":10,"DEX":10,"CON":10,"INT":10,"WIS":10,"CHA":10},
+            "proficiencies": [], "hp": 10, "max_hp": 10
+        },
+        "inventory": [], "quests": [], "world":{"genre":""},
+        "level": 1, "xp": 0, "summary":"", "last_scene": "",
+        "choice_buffer": {"scene_id":"", "choices":[]},
+        "roll_mode": "normal",
+        "last_rest_ts": 0,
+    })
+    gsm.save()
 
-async def handle_genre(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        genre = update.message.text.strip()
-        logger.debug(f"Genre: {genre}")
-        context.user_data["gsm"].update_state({"character": {"genre": genre}})
-        await update.message.reply_text(
-            "Great! What's your race and class?\n(e.g.: 'Elf Ranger')"
-        )
-        return CHOOSING_RACE_CLASS
-    except Exception as e:
-        logging.error(f"Genre error: {e}")
-        await update.message.reply_text("⚠️ Please enter a valid genre.")
-        return CHOOSING_GENRE
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("High Fantasy", callback_data="genre|High Fantasy"),
+         InlineKeyboardButton("Sci-Fantasy", callback_data="genre|Sci-Fantasy")],
+        [InlineKeyboardButton("Dark Gothic", callback_data="genre|Dark Gothic"),
+         InlineKeyboardButton("Sword & Sorcery", callback_data="genre|Sword & Sorcery")]
+    ])
+    await update.effective_chat.send_message("Welcome, adventurer! Choose a genre to begin:", reply_markup=kb)
+    return CHOOSING_GENRE
 
-async def handle_race_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        txt = update.message.text.strip()
-        logger.debug(f"Race/Class: {txt}")
-        parts = txt.split()
-        race = parts[0]
-        cls = " ".join(parts[1:]) or "Adventurer"
-        context.user_data["gsm"].update_state({
-            "character": {"race": race, "class": cls}
-        })
-        await update.message.reply_text("What's your character's name?")
-        return CHOOSING_NAME
-    except Exception as e:
-        logging.error(f"Race/Class error: {e}")
-        await update.message.reply_text("⚠️ Use format 'Race Class'. Try again.")
-        return CHOOSING_RACE_CLASS
+async def on_genre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    _, genre = query.data.split("|",1)
+    gsm = user_gsm(update)
+    gsm.state["world"]["genre"] = genre
+    gsm.save()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Human Fighter", callback_data="class|Human Fighter"),
+         InlineKeyboardButton("Elf Rogue", callback_data="class|Elf Rogue")],
+        [InlineKeyboardButton("Dwarf Cleric", callback_data="class|Dwarf Cleric"),
+         InlineKeyboardButton("Half-Orc Barbarian", callback_data="class|Half-Orc Barbarian")]
+    ])
+    await query.message.chat.send_message(f"Genre set to *{genre}*.\nChoose race/class:", parse_mode="Markdown", reply_markup=kb)
+    return CHOOSING_CLASS
 
-async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        name = update.message.text.strip()
-        logger.debug(f"Name: {name}")
-        context.user_data["gsm"].update_state({"character": {"name": name}})
-        await update.message.reply_text("What drives your character? (e.g.: 'Find the lost crown')")
-        return CHOOSING_MOTIVATION
-    except Exception as e:
-        logging.error(f"Name error: {e}")
-        await update.message.reply_text("⚠️ Invalid name. Try again.")
-        return CHOOSING_NAME
+async def on_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    _, rc = query.data.split("|",1)
+    gsm = user_gsm(update)
+    gsm.state["character"]["race_class"] = rc
+    gsm.save()
+    await query.message.chat.send_message(f"Great choice: *{rc}*.\nWhat's your character's name?", parse_mode="Markdown")
+    return ENTERING_NAME
 
-async def handle_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        motivation = update.message.text.strip()
-        logger.debug(f"Motivation: {motivation}")
-        gsm = context.user_data["gsm"]
-        gsm.update_character("motivation", motivation)
+async def on_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    name = update.message.text.strip()
+    gsm.state["character"]["name"] = name
+    gsm.save()
+    await update.message.reply_text(f"Nice to meet you, *{name}*.\nWhat's your core motivation?", parse_mode="Markdown")
+    return ENTERING_MOTIVATION
 
-        # Roll abilities
-        stats = ["Strength", "Dexterity", "Constitution", "Intelligence", "Wisdom", "Charisma"]
-        rolls = [random.randint(3, 20) for _ in stats]
-        random.shuffle(stats)
-        abilities = {s: v for s, v in zip(stats, rolls)}
-        gsm.update_character("abilities", abilities)
+async def on_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    mot = update.message.text.strip()
+    gsm.state["character"]["motivation"] = mot
 
-        await update.message.reply_text(
-            "Your abilities:\n" + "\n".join(f"{k}: {v}" for k, v in abilities.items())
-        )
+    # Seed proficiencies by class
+    rc = gsm.state["character"]["race_class"].lower()
+    profs = []
+    if "rogue" in rc:
+        profs = ["Stealth","Perception"]
+    elif "fighter" in rc or "barbarian" in rc:
+        profs = ["Athletics","Intimidation"]
+    elif "cleric" in rc:
+        profs = ["Medicine","Religion"]
+    gsm.state["character"]["proficiencies"] = profs
 
-        pb = context.user_data["prompt_builder"]
-        intro = await generate_gpt_response(pb.build_intro_prompt(gsm.state["character"]))
-        gsm.log_action(f"DM: {intro}")
-        gsm.update_state({"story": intro})
-        await context.bot.send_message(update.effective_chat.id, intro)
-        return GAME_LOOP
+    # Starting gear kit
+    kit = class_kit_for(rc)
+    gsm.state["inventory"] = list({*gsm.state.get("inventory", []), *kit})
 
-    except Exception as e:
-        logging.error(f"Motivation error: {e}")
-        await update.message.reply_text("⚠️ Character setup failed. Use /start to retry.")
-        return ConversationHandler.END
+    # Ability score generation per user preference: d20 for each stat (3–20 cap via randint)
+    rolls = {k: random.randint(3,20) for k in ["STR","DEX","CON","INT","WIS","CHA"]}
+    gsm.state["character"]["abilities"] = rolls
+    # HP = 8 + CON mod
+    gsm.state["character"]["max_hp"] = 8 + max(-5, (rolls["CON"]-10)//2)
+    gsm.state["character"]["hp"] = gsm.state["character"]["max_hp"]
 
-# ——— Main Story Loop ——————————————————————————————————————————————
-
-async def story(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        gsm = context.user_data.get("gsm")
-        if not gsm:
-            target = update.callback_query or update.message
-            await target.reply_text("❌ No active game. Use /start.")
-            return ConversationHandler.END
-
-        is_cb = bool(update.callback_query)
-        user_input = "Continuing story..." if is_cb else update.message.text
-        if not is_cb and (not user_input or user_input.strip().lower() == "/story"):
-            await update.message.reply_text("What would you like to do next?")
-            return GAME_LOOP
-        chat_id = update.effective_chat.id
-        logger.debug(f"Story input: {user_input}")
-
-        prompt = context.user_data["prompt_builder"].build_scene_prompt(user_input)
-        raw = await generate_gpt_response(prompt)
-        gsm.log_action(f"Player: {user_input}")
-
-        m = re.search(r"narrative\s*:\s*(.*?)\s*choices\s*:\s*(.*)", raw, flags=re.IGNORECASE|re.DOTALL)
-        if m:
-            narrative = m.group(1).strip()
-            choices_block = m.group(2).strip()
-            gsm.update_state({
-                "story": (gsm.state.get("story", "") + "\n" + narrative).strip()
-            })
-
-            lines = [l.strip() for l in choices_block.splitlines() if re.match(r"\d+\)", l)]
-            buttons, parsed = [], []
-            for line in lines:
-                idx = int(line.split(")")[0])
-                text = line.split(")", 1)[1].split("(")[0].strip()
-                dc_m = re.search(r"\(DC\s*(\d+)\s*([A-Za-z]+)\)", line, re.IGNORECASE)
-                dc = int(dc_m.group(1)) if dc_m else None
-                ability = dc_m.group(2) if dc_m else None
-                parsed.append({"text": text, "dc": dc, "ability": ability})
-                buttons.append([InlineKeyboardButton(f"{idx}. {text}", callback_data=f"choice_{idx}")])
-
-            context.user_data["current_choices"] = parsed
-            markup = InlineKeyboardMarkup(buttons)
-            await context.bot.send_message(chat_id, f"{narrative}\n\nChoose your action:", reply_markup=markup)
-            return HANDLING_CHOICE
-
-        special_lines = re.findall(r"^SPECIAL\s*:\s*(.+)$", raw, flags=re.IGNORECASE | re.MULTILINE)
-        if special_lines:
-            narrative = re.sub(r"^SPECIAL\s*:\s*.*$", "", raw, flags=re.IGNORECASE | re.MULTILINE).strip()
-            parsed, buttons = [], []
-            for i, line in enumerate(special_lines, start=1):
-                m2 = re.search(r"CHECK\s*:\s*([A-Za-z]+)\s*,\s*DC\s*:\s*(\d+)", line, re.IGNORECASE)
-                if not m2:
-                    continue
-                ability = m2.group(1)
-                dc = int(m2.group(2))
-                parsed.append({"text": f"Check {ability}", "dc": dc, "ability": ability})
-                buttons.append([InlineKeyboardButton(f"Roll {ability} (DC {dc})", callback_data=f"choice_{i}")])
-
-            if parsed:
-                gsm.update_state({
-                    "story": (gsm.state.get("story", "") + "\n" + narrative).strip()
-                })
-                context.user_data["current_choices"] = parsed
-                markup = InlineKeyboardMarkup(buttons)
-                await context.bot.send_message(chat_id, f"{narrative}\n\nWhich check will you make?", reply_markup=markup)
-                return HANDLING_CHOICE
-
-        fallback = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Continue Story", callback_data="continue_story")]]
-        )
-        await context.bot.send_message(chat_id, raw, reply_markup=fallback)
-        return GAME_LOOP
-
-    except Exception as e:
-        logging.error(f"Story error: {e}")
-        target = update.callback_query or update.message
-        await target.reply_text("⚠️ Story progression failed.")
-        return GAME_LOOP
-
-async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        await query.answer()
-        chat_id = query.message.chat_id
-        logger.debug(f"Choice callback: {query.data}")
-
-        idx = int(query.data.split("_")[1]) - 1
-        choices = context.user_data.get("current_choices", [])
-        if idx < 0 or idx >= len(choices):
-            await context.bot.send_message(chat_id, "Invalid choice!")
-            return GAME_LOOP
-
-        sel = choices[idx]
-        gsm = context.user_data["gsm"]
-        gsm.log_action(f"Choice: {sel['text']}")
-
-        if sel["dc"] is not None:
-            ability = sel["ability"]
-            score = gsm.character["abilities"].get(ability, 10)
-            mod = calculate_modifier(score)
-            context.user_data["pending_roll"] = {
-                "dc": sel["dc"], "ability": ability, "choice_text": sel["text"]
-            }
-            await context.bot.send_message(
-                chat_id,
-                f"🛡️ {ability} Check!\nYour {ability}: {score} (Mod {mod:+})\n"
-                f"Target DC: {sel['dc']}\n\nChoose:",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🎲 Roll D20", callback_data="perform_roll")
-                ]])
-            )
-            return AWAITING_ROLL
-
-        return await resolve_choice(update, context, sel["text"])
-
-    except Exception as e:
-        logging.error(f"Choice error: {e}")
-        await context.bot.send_message(update.effective_chat.id, "⚠️ Choice processing failed.")
-        return GAME_LOOP
-
-async def resolve_choice(update, context, choice_text, roll_result=None):
-    try:
-        gsm = context.user_data["gsm"]
-        pb = context.user_data["prompt_builder"]
-        pend = context.user_data.get("pending_roll", {})
-        chat_id = update.effective_chat.id
-
-        outcome = await generate_gpt_response(
-            pb.build_outcome_prompt(choice_text, roll_result)
-        )
-        gsm.log_action(f"DM: {outcome}")
-        gsm.update_state({
-            "story": (gsm.state.get("story", "") + "\n" + outcome).strip()
-        })
-
-        btn = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Continue Story", callback_data="continue_story")]]
-        )
-        await context.bot.send_message(chat_id, outcome, reply_markup=btn)
-        return GAME_LOOP
-
-    except Exception as e:
-        logging.error(f"Resolve error: {e}")
-        await context.bot.send_message(update.effective_chat.id, "⚠️ Outcome generation failed.")
-        return GAME_LOOP
-
-async def handle_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        await query.answer()
-        chat_id = query.message.chat_id
-        logger.debug("Rolling d20")
-
-        pend = context.user_data.get("pending_roll")
-        if not pend:
-            await context.bot.send_message(chat_id, "No active roll!")
-            return GAME_LOOP
-
-        gsm = context.user_data["gsm"]
-        ability = pend["ability"]
-        score = gsm.character["abilities"].get(ability, 10)
-        mod = calculate_modifier(score)
-        roll = random.randint(1, 20)
-        total = roll + mod
-        logger.info(f"🎲 Rolled {roll} + {mod} modifier = {total} vs DC {pend['dc']}")
-
-        check_result = {
-            "roll": roll,
-            "mod": mod,
-            "total": total,
-            "dc": pend["dc"],
-            "ability": ability
-        }
-
-        prompt = context.user_data["prompt_builder"].build_outcome_prompt(
-            pend["choice_text"], check_result
-        )
-        outcome = await generate_gpt_response(prompt)
-
-        gsm.log_action(f"Roll: {roll} + {mod} vs DC {pend['dc']} → {'Success' if total >= pend['dc'] else 'Failure'}")
-        gsm.log_action(f"DM: {outcome}")
-        gsm.update_state({
-            "story": (gsm.state.get("story", "") + "\n" + outcome).strip()
-        })
-
-        await context.bot.send_message(
-            chat_id,
-            f"🎲 {ability} Check: {roll} + {mod} = {total}\nDC: {pend['dc']}\n\n{outcome}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Continue Story", callback_data="continue_story")]]
-            )
-        )
-        del context.user_data["pending_roll"]
-        return GAME_LOOP
-
-    except Exception as e:
-        logging.error(f"Roll error: {e}")
-        await context.bot.send_message(update.effective_chat.id, "⚠️ Roll failed.")
-        return GAME_LOOP
-
-# ——— Utility Commands ————————————————————————————————————————————
-
-async def sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("❌ No game. Use /start.")
-        return ConversationHandler.END
-    char = gsm.state.get("character",{})
-    abil = char.get("abilities",{})
-    text = (
-        "🧙 Character Sheet 🧙\n"
-        f"Name: {char.get('name','???')}\n"
-        f"Race: {char.get('race','???')}\n"
-        f"Class: {char.get('class','???')}\n"
-        f"Motivation: {char.get('motivation','???')}\n\n"
-        "Abilities:\n" +
-        "\n".join(f"{k}: {v}" for k,v in abil.items())
+    gsm.autosave()
+    msg = (
+        f"Motivation set: *{mot}*.\n\n"
+        "Your starting gear: " + ", ".join(kit) + "\n\n"
+        "Ability rolls (d20 each):\n"
+        f"{abilities_block(rolls)}\n\n"
+        "Type anything to begin your adventure!"
     )
-    await update.message.reply_text(text)
-    return GAME_LOOP
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return IN_GAME
+
+# ---------- Game Loop ----------
+async def story_or_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    pb = PromptBuilder(gsm)
+    text = update.message.text.strip()
+
+    # Opening
+    if not gsm.state.get("last_scene"):
+        opener = pb.build_opening_scene()
+        await send_scene(update, context, opener, gsm)
+        return IN_GAME
+
+    # Continue scene from freeform input
+    res = pb.build_scene_prompt(text)
+    await send_scene(update, context, res, gsm)
+    return IN_GAME
+
+async def send_scene(update: Update, context: ContextTypes.DEFAULT_TYPE, scene: Dict[str, Any], gsm: GameStateManager):
+    # Save narrative + rolling summary for context
+    gsm.state["last_scene"] = scene.get("narrative", "")
+    gsm.state["summary"] = (gsm.state.get("summary","") + " " + gsm.state["last_scene"]).strip()[-2000:]
+
+    # Choice buffer with scene_id for callback integrity
+    scene_id = secrets.token_hex(4)
+    choices = scene.get("choices", []) or []
+    gsm.state["choice_buffer"] = {"scene_id": scene_id, "choices": choices}
+    gsm.autosave()
+
+    # Render narrative
+    await update.effective_chat.send_message(scene.get("narrative","(no narrative)"))
+
+    # Render choices, if any
+    if choices:
+        rows = []
+        for i, c in enumerate(choices):
+            label = f"{i+1}) {c.get('text','')}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"choose|{scene_id}|{i}")])
+        kb = InlineKeyboardMarkup(rows)
+        await update.effective_chat.send_message("What do you do?", reply_markup=kb)
+
+async def on_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    _, seen_scene_id, idx_s = query.data.split("|",2)
+    idx = int(idx_s)
+
+    gsm = user_gsm(update)
+    pb = PromptBuilder(gsm)
+
+    buf = gsm.state.get("choice_buffer", {"scene_id":"", "choices":[]})
+    if seen_scene_id != buf.get("scene_id"):
+        await query.message.chat.send_message("Those choices have expired. Say anything to continue.")
+        return IN_GAME
+
+    last_choices = buf.get("choices", [])
+    if not last_choices or idx < 0 or idx >= len(last_choices):
+        await query.message.chat.send_message("That choice is no longer valid. Please type your action.")
+        return IN_GAME
+
+    choice = last_choices[idx]
+    # roll check (respects roll_mode + proficiency)
+    roll = gsm.compute_check(choice.get("ability","Strength"), int(choice.get("dc", 10)))
+    raw = ", ".join(str(r) for r in roll["raw"])
+    roll_txt = (
+        f"🎲 {rollmode_label(roll['mode'])} d20 ({raw})  "
+        f"mod {roll['mod']:+d}  prof {roll['prof']:+d}  "
+        f"= *{roll['total']}* vs DC *{roll['dc']}* → "
+        f"{'**SUCCESS**' if roll['success'] else '**FAIL**'}"
+    )
+    await query.message.chat.send_message(roll_txt, parse_mode="Markdown")
+
+    # LLM outcome
+    outcome = pb.build_outcome_prompt(choice, roll)
+    await apply_consequences(update, gsm, outcome.get("consequences", {}))
+
+    # present outcome + next options (new scene_id)
+    await update.effective_chat.send_message(outcome.get("narrative",""))
+    follow = outcome.get("followup_choices", []) or []
+    new_scene_id = secrets.token_hex(4)
+    gsm.state["choice_buffer"] = {"scene_id": new_scene_id, "choices": follow}
+    gsm.autosave()
+
+    if follow:
+        rows = [[InlineKeyboardButton(f"{i+1}) {c.get('text','')}", callback_data=f"choose|{new_scene_id}|{i}")]
+                for i,c in enumerate(follow)]
+        kb = InlineKeyboardMarkup(rows)
+        await update.effective_chat.send_message("Next step:", reply_markup=kb)
+
+    return IN_GAME
+
+async def apply_consequences(update: Update, gsm: GameStateManager, cons: Dict[str, Any]):
+    hp_delta = int(cons.get("hp_delta", 0))
+    xp_delta = int(cons.get("xp_delta", 0))
+    items_gained = cons.get("items_gained", [])
+    items_lost = cons.get("items_lost", [])
+    milestone = bool(cons.get("milestone", False))
+
+    ch = gsm.state["character"]
+    ch["hp"] = max(0, min(ch["max_hp"], ch.get("hp", 10) + hp_delta))
+    # inventory update
+    inv = [it for it in gsm.state.get("inventory", []) if it not in items_lost]
+    inv.extend(items_gained)
+    gsm.state["inventory"] = inv
+
+    if milestone: gsm.award_milestone()
+    if xp_delta: gsm.award_xp(xp_delta)
+
+    gsm.autosave()
+
+    lines = []
+    if hp_delta: lines.append(f"HP {'+' if hp_delta>0 else ''}{hp_delta} → {ch['hp']}/{ch['max_hp']}")
+    if xp_delta: lines.append(f"XP +{xp_delta} (Total {gsm.state['xp']})")
+    if milestone: lines.append("Milestone reached!")
+    if items_gained: lines.append(f"Gained: {', '.join(items_gained)}")
+    if items_lost: lines.append(f"Lost: {', '.join(items_lost)}")
+    if lines:
+        await update.effective_chat.send_message("• " + "\n• ".join(lines))
+
+# ---------- Out-of-game ----------
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    pb = PromptBuilder(gsm)
+    # allow "/ask something" or reply after /ask
+    content = update.message.text
+    q = content.split(" ", 1)[1].strip() if " " in content else "Explain checks and leveling briefly."
+    answer = pb.build_clarification_prompt(q)
+    await update.message.reply_text(answer)
+
+# ---------- Display ----------
+async def sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    ch = gsm.state["character"]
+    level = gsm.state.get("level",1)
+    xp = gsm.state.get("xp",0)
+    mode = gsm.state.get("roll_mode","normal")
+    msg = (
+        f"*{ch.get('name','Unnamed')}* — {ch.get('race_class','')}\n"
+        f"Motivation: {ch.get('motivation','')}\n"
+        f"Level {level} | XP {xp} | HP {ch.get('hp',0)}/{ch.get('max_hp',0)} | Prof +{proficiency_bonus(level)}\n"
+        f"Roll Mode: {rollmode_label(mode)}\n\n"
+        f"{abilities_block(ch.get('abilities',{}))}\n\n"
+        f"Proficiencies: {', '.join(ch.get('proficiencies', [])) or 'None'}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("❌ No game. Use /start.")
-        return ConversationHandler.END
-    items = gsm.state.get("inventory",[])
-    txt = "Inventory:\n" + "\n".join(f"- {i}" for i in items) if items else "Empty."
+    gsm = user_gsm(update)
+    inv = gsm.state.get("inventory", [])
+    if not inv:
+        await update.message.reply_text("Your pack is empty.")
+    else:
+        await update.message.reply_text("Inventory:\n- " + "\n- ".join(inv))
+
+async def story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    txt = gsm.state.get("last_scene") or "No story yet—say anything to begin."
     await update.message.reply_text(txt)
-    return GAME_LOOP
 
-async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("❌ No game. Use /start.")
-        return ConversationHandler.END
+async def xp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    await update.message.reply_text(f"Level {gsm.state.get('level',1)} — XP {gsm.state.get('xp',0)}")
 
-    if context.args:
-        item = " ".join(context.args).strip()
-        inv = gsm.state.get("inventory",[])
-        inv.append(item)
-        gsm.update_state({"inventory":inv})
-        await update.message.reply_text(f"Added **{item}** to your inventory!")
-        return GAME_LOOP
+async def rest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    now = int(time.time())
+    # Optional cooldown: 60s to avoid spam; tweak/remove as desired
+    if gsm.state.get("last_rest_ts", 0) and now - gsm.state["last_rest_ts"] < 60:
+        await update.message.reply_text("You need a little more time before another long rest.")
+        return
+    ch = gsm.state["character"]
+    ch["hp"] = ch["max_hp"]
+    gsm.state["last_rest_ts"] = now
+    gsm.autosave()
+    await update.message.reply_text(f"You rest and recover to full: {ch['hp']}/{ch['max_hp']} HP.")
 
-    await update.message.reply_text("What item would you like to add?")
-    return WAITING_ITEM
+async def rollmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    args = (update.message.text or "").split()
+    if len(args) == 1:
+        await update.message.reply_text("Usage: /rollmode normal | adv | dis")
+        return
+    val = args[1].lower()
+    mode = "normal"
+    if val in ("adv","advantage"): mode = "advantage"
+    elif val in ("dis","disadvantage"): mode = "disadvantage"
+    gsm.state["roll_mode"] = mode
+    gsm.autosave()
+    await update.message.reply_text(f"Roll mode set to: {rollmode_label(mode)}")
 
-async def save_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("❌ No game. Use /start.")
-        return ConversationHandler.END
-    item = update.message.text.strip()
-    inv = gsm.state.get("inventory",[])
-    inv.append(item)
-    gsm.update_state({"inventory":inv})
-    await update.message.reply_text(f"Added **{item}** to your inventory!")
-    return GAME_LOOP
+async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    gsm.autosave()
+    await update.message.reply_text("Game saved. (Auto-rotating backups kept.)")
 
-async def interact_npc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("❌ No game. Use /start.")
-        return ConversationHandler.END
-    npc = context.args[0] if context.args else "Stranger"
-    resp = await generate_gpt_response(
-        context.user_data["prompt_builder"].build_npc_prompt(npc)
-    )
-    await update.message.reply_text(resp)
-    return GAME_LOOP
+async def load_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    gsm.__post_init__()  # reload from file
+    await update.message.reply_text("Game loaded from last save.")
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    save_dir = os.path.join("saves", user_id)
-    if "gsm" in context.user_data:
-        del context.user_data["gsm"]
-    if os.path.exists(save_dir):
-        import shutil
-        shutil.rmtree(save_dir)
-    await update.message.reply_text("🗑️ Game reset! Use /start.")
-    return ConversationHandler.END
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    import glob, os
+    backups = sorted(glob.glob(f"saves/{gsm.user_id}.*.bak.json"))
+    if not backups:
+        await update.message.reply_text("No backups found.")
+        return
+    newest = backups[-1]
+    Path(f"saves/{gsm.user_id}.json").write_text(Path(newest).read_text(encoding="utf-8"), encoding="utf-8")
+    gsm.__post_init__()
+    await update.message.reply_text(f"Restored from {os.path.basename(newest)}.")
 
-async def boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gsm = context.user_data.get("gsm")
-    if not gsm:
-        await update.message.reply_text("No game loaded. Use /start.")
-        return ConversationHandler.END
-
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gsm = user_gsm(update)
+    f = gsm.filename
     try:
-        ability = context.args[0].capitalize()
-        amount = int(context.args[1])
-        current = gsm.state["character"]["abilities"].get(ability, 10)
-        gsm.state["character"]["abilities"][ability] = current + amount
-        gsm.save()
-        await update.message.reply_text(
-            f"📈 {ability} boosted from {current} to {current + amount}"
-        )
-    except Exception as e:
-        logger.error(f"Boost error: {e}")
-        await update.message.reply_text("Usage: /boost [Ability] [Amount]")
+        if f and f.exists():
+            f.unlink()
+    except Exception:
+        pass
+    gsm.__post_init__()
+    await update.message.reply_text("Reset complete. Use /start to begin anew.")
 
-    return GAME_LOOP
-
-async def set_commands(app):
-    commands = [
-        BotCommand("start","Begin/continue adventure"),
-        BotCommand("story","Progress narrative"),
-        BotCommand("sheet","View character sheet"),
-        BotCommand("inventory","Check inventory"),
-        BotCommand("npc","Interact NPC"),
-        BotCommand("additem","Add item"),
-        BotCommand("reset","Reset game"),
-        BotCommand("boost", "Increase an ability score (e.g., /boost Strength 2)")
-    ]
-    await app.bot.set_my_commands(commands)
-
+# ---------- Main ----------
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    persistence = TelegramJSONPersistence()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            CHOOSING_GENRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_genre)],
-            CHOOSING_RACE_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_race_class)],
-            CHOOSING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
-            CHOOSING_MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_motivation)],
-            GAME_LOOP: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, story),
-                CommandHandler("story", story),
-                CallbackQueryHandler(story, pattern="^continue_story$")
-            ],
-            HANDLING_CHOICE: [
-                CallbackQueryHandler(handle_choice, pattern=r"^choice_\d+$")
-            ],
-            AWAITING_ROLL: [
-                CallbackQueryHandler(handle_roll, pattern="^perform_roll$")
-            ],
-            WAITING_ITEM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_item)
+            CHOOSING_GENRE: [CallbackQueryHandler(on_genre, pattern=r"^genre\|")],
+            CHOOSING_CLASS: [CallbackQueryHandler(on_class, pattern=r"^class\|")],
+            ENTERING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_name)],
+            ENTERING_MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_motivation)],
+            IN_GAME: [
+                CallbackQueryHandler(on_choose, pattern=r"^choose\|"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, story_or_input),
             ],
         },
-        fallbacks=[CommandHandler("reset", reset)],
-        per_message=False,
+        fallbacks=[CommandHandler("start", start)],
         per_chat=True,
-        per_user=True
+        name="dm_conversation",
+        persistent=True,
     )
 
-    app.add_handler(conv)
+    # Commands
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("sheet", sheet))
     app.add_handler(CommandHandler("inventory", inventory))
-    app.add_handler(CommandHandler("npc", interact_npc))
-    app.add_handler(CommandHandler("additem", add_item))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("boost", boost))
+    app.add_handler(CommandHandler("ask", ask))
+    app.add_handler(CommandHandler("story", story))
+    app.add_handler(CommandHandler("xp", xp_cmd))
+    app.add_handler(CommandHandler("rest", rest_cmd))
+    app.add_handler(CommandHandler("rollmode", rollmode_cmd))
+    app.add_handler(CommandHandler("save", save_cmd))
+    app.add_handler(CommandHandler("load", load_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
 
-    app.post_init = set_commands
-    app.run_polling()
+    app.add_handler(conv)
+
+    logger.info("Bot starting…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
