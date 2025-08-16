@@ -29,7 +29,7 @@ DM_OPENAI_API_KEY = os.getenv("DM_OPENAI_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("DM_TELEGRAM_BOT_TOKEN not set (env or .env).")
-if not OPENAI_API_KEY:
+if not DM_OPENAI_API_KEY:
     raise RuntimeError("DM_OPENAI_API_KEY not set (env or .env).")
 
 logger = setup_logger()
