@@ -14,42 +14,62 @@ ALLOWED_ABILITIES_AND_SKILLS = (
 )
 
 class PromptBuilder:
-    """
-    Builds prompts for the Dungeon Master game and calls the LLM with structured outputs.
-    All story generations return strict JSON for deterministic UI/logic.
-    """
     def __init__(self, gsm):
         self.gsm = gsm
-        api_key = os.getenv("DM_OPENAI_API_KEY")
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DM_OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError(
-                "DM_OPENAI_API_KEY is not set. "
-                "Put it in your environment or in a .env file next to dungeon_master.py."
-            )
+            raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---------- LLM helper ----------
+    # ---------- low-level wrapper that is GPT-5 safe ----------
+    def _chat(self, *, messages, response_format=None, temperature=None, max_tokens=1200):
+        """
+        Try GPT-5-style params first (max_completion_tokens). If the model rejects
+        temperature or token param, transparently retry with compatible settings.
+        """
+        params = {
+            "model": MODEL,
+            "messages": messages,
+            "max_completion_tokens": max_tokens,  # GPT-5 & reasoning models
+        }
+        if response_format:
+            params["response_format"] = response_format
+        if temperature is not None:
+            params["temperature"] = temperature
+
+        try:
+            return self.client.chat.completions.create(**params)
+        except Exception as e:
+            msg = str(e)
+            # Some GPT-5 variants may reject temperature
+            if "Unsupported parameter: 'temperature'" in msg:
+                params.pop("temperature", None)
+                return self.client.chat.completions.create(**params)
+            # Older models expect max_tokens
+            if "Unsupported parameter: 'max_completion_tokens'" in msg:
+                params.pop("max_completion_tokens", None)
+                params["max_tokens"] = max_tokens
+                return self.client.chat.completions.create(**params)
+            # Rare: some gateways still want max_tokens AND reject temperature
+            if "Unrecognized request argument" in msg and "max_completion_tokens" in msg:
+                params.pop("max_completion_tokens", None)
+                params["max_tokens"] = max_tokens
+                params.pop("temperature", None)
+                return self.client.chat.completions.create(**params)
+            raise
+
     def _call_llm_json(self, system: str, user: str, temperature: float = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
-        """
-        Call the model and require JSON output.
-        """
-        resp = self.client.chat.completions.create(
-            model=MODEL,
+        resp = self._chat(
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
         )
         text = resp.choices[0].message.content.strip()
         try:
             return json.loads(text)
         except Exception:
-            # Best-effort salvage of a JSON object
-            start = text.find("{")
-            end = text.rfind("}")
+            start, end = text.find("{"), text.rfind("}")
             if start != -1 and end != -1 and end > start:
                 return json.loads(text[start:end+1])
             raise
@@ -133,11 +153,11 @@ class PromptBuilder:
             "If it's rules, be concrete; if world/lore, respect established facts.\n"
             f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
         )
-        resp = self.client.chat.completions.create(
-            model=MODEL,
+        resp = self._chat(
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.4,
             max_tokens=400,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
         return resp.choices[0].message.content.strip()
+
 
