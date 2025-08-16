@@ -197,11 +197,11 @@ class GameStateManager:
 # ---------- Telegram Persistence (PTB) ----------
 class TelegramJSONPersistence(BasePersistence):
     """
-    Minimal PTB persistence to keep user/chat/bot data & conversations across restarts.
-    This is additive to the per-user GameStateManager saves.
+    JSON file persistence for PTB v20+. Implements all required async methods so
+    ConversationHandler state, user/chat/bot data, and callback data survive restarts.
     """
     def __init__(self, path: str = "ptb_persistence.json"):
-        super().__init__()
+        super().__init__()  # PTB base init
         self.path = Path(path)
         self.data: Dict[str, Any] = {
             "user_data": {}, "chat_data": {}, "bot_data": {},
@@ -211,11 +211,23 @@ class TelegramJSONPersistence(BasePersistence):
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
+                # If the file is corrupted, keep defaults and overwrite on next save.
                 pass
 
     def _save(self):
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
+    # --- REQUIRED: what we want PTB to store ---
+    def get_persistence_input(self) -> PersistenceInput:
+        # Persist *everything* (user/chat/bot data, conversations, callback_data)
+        return PersistenceInput(
+            user_data=True, chat_data=True, bot_data=True,
+            conversations=True, callback_data=True
+        )
+
+    # --- REQUIRED: user/chat/bot data getters ---
     async def get_user_data(self) -> Dict[str, Dict[str, Any]]:
         return self.data.get("user_data", {})
 
@@ -225,24 +237,16 @@ class TelegramJSONPersistence(BasePersistence):
     async def get_bot_data(self) -> Dict[str, Any]:
         return self.data.get("bot_data", {})
 
-    async def update_conversation(self, name: str, key: tuple, new_state: Optional[object]):
-        convs = self.data.setdefault("conversations", {}).setdefault(name, {})
-        if new_state is None:
-            convs.pop(str(key), None)
-        else:
-            convs[str(key)] = new_state
-        self._save()
+    # --- REQUIRED: conversations (plural!) ---
+    async def get_conversations(self, name: str) -> Dict[str, object]:
+        # PTB expects a mapping of key -> state for a given conversation name
+        return self.data.get("conversations", {}).get(name, {}).copy()
 
-    async def get_conversation(self, name: str, key: tuple) -> Optional[object]:
-        return self.data.get("conversations", {}).get(name, {}).get(str(key))
-
+    # --- REQUIRED: callback data ---
     async def get_callback_data(self) -> Dict[str, Any]:
         return self.data.get("callback_data", {})
 
-    async def update_callback_data(self, data: Dict[str, Any]):
-        self.data["callback_data"] = data
-        self._save()
-
+    # --- REQUIRED: updaters (PTB calls these when state changes) ---
     async def update_user_data(self, user_id: int, data: Dict[str, Any]):
         self.data.setdefault("user_data", {})[str(user_id)] = data
         self._save()
@@ -251,5 +255,46 @@ class TelegramJSONPersistence(BasePersistence):
         self.data.setdefault("chat_data", {})[str(chat_id)] = data
         self._save()
 
-    def get_persistence_input(self) -> PersistenceInput:
-        return PersistenceInput(user_data=True, chat_data=True, bot_data=True, conversations=True, callback_data=True)
+    async def update_bot_data(self, data: Dict[str, Any]):
+        self.data["bot_data"] = data
+        self._save()
+
+    async def update_conversation(self, name: str, key: tuple, new_state: Optional[object]):
+        convs_for_name = self.data.setdefault("conversations", {}).setdefault(name, {})
+        skey = str(key)
+        if new_state is None:
+            convs_for_name.pop(skey, None)
+        else:
+            convs_for_name[skey] = new_state
+        self._save()
+
+    async def update_callback_data(self, data: Dict[str, Any]):
+        self.data["callback_data"] = data
+        self._save()
+
+    # --- REQUIRED: drops (PTB cleans up when a user/chat disappears) ---
+    async def drop_user_data(self, user_id: int):
+        self.data.get("user_data", {}).pop(str(user_id), None)
+        self._save()
+
+    async def drop_chat_data(self, chat_id: int):
+        self.data.get("chat_data", {}).pop(str(chat_id), None)
+        self._save()
+
+    # --- REQUIRED: refresh (PTB gives you the in-memory dict it's using) ---
+    async def refresh_user_data(self, user_id: int, user_data: Dict[str, Any]):
+        # Keep our backing store in sync with PTB's in-memory reference
+        self.data.setdefault("user_data", {})[str(user_id)] = user_data
+        self._save()
+
+    async def refresh_chat_data(self, chat_id: int, chat_data: Dict[str, Any]):
+        self.data.setdefault("chat_data", {})[str(chat_id)] = chat_data
+        self._save()
+
+    async def refresh_bot_data(self, bot_data: Dict[str, Any]):
+        self.data["bot_data"] = bot_data
+        self._save()
+
+    # --- REQUIRED: flush (PTB may call this on shutdown) ---
+    async def flush(self):
+        self._save()
