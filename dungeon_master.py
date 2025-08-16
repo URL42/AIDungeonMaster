@@ -25,7 +25,7 @@ from prompt_builder import PromptBuilder
 load_dotenv()  # load .env from working dir
 
 TELEGRAM_BOT_TOKEN = os.getenv("DM_TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DM_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("DM_TELEGRAM_BOT_TOKEN not set (env or .env).")
