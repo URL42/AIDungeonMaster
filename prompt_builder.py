@@ -49,7 +49,7 @@ class PromptBuilder:
             "max_output_tokens": max_tokens,
         }
         if json_schema:
-            params["response_format"] = {
+            params["format"] = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "dm_struct",
