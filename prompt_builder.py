@@ -3,13 +3,24 @@ import os
 import json
 import logging
 from typing import Dict, Any, Optional, List
+
+# Load .env here too, so this file can run standalone
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv if you don't have it
+    load_dotenv()
+except Exception:
+    pass
+
 from openai import OpenAI
 
-# --- Make the client honor DM_OPENAI_API_KEY ---
-if not os.getenv("OPENAI_API_KEY") and os.getenv("DM_OPENAI_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = os.getenv("DM_OPENAI_API_KEY")
+# ---- Resolve API key from either name ----
+_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("DM_OPENAI_API_KEY")
+if not _API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY or DM_OPENAI_API_KEY in your environment/.env")
 
-client = OpenAI()  # reads OPENAI_API_KEY from env (now mapped from DM_OPENAI_API_KEY if needed)
+# Construct client explicitly with the resolved key
+client = OpenAI(api_key=_API_KEY)
+
 log = logging.getLogger("dm_bot")
 
 PRIMARY_MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
