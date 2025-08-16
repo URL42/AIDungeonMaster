@@ -36,7 +36,7 @@ class PromptBuilder:
         for m in messages:
             wrapped.append({
                 "role": m["role"],
-                "content": [{"type": "text", "text": m["content"]}],
+                "content": [{"type": "input_text", "text": m["content"]}],
             })
         return wrapped
 
