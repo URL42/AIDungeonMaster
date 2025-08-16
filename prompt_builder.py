@@ -49,12 +49,11 @@ class PromptBuilder:
             "max_output_tokens": max_tokens,
         }
         if json_schema:
-            params["text"] = {
-                "format": {
-                    "type": "json_schema",
+            params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
                     "name": "dm_struct",
                     "schema": json_schema,
-                    "strict": True,
                 }
             }
         return self.client.responses.create(**params)
@@ -147,10 +146,12 @@ class PromptBuilder:
                             "tags": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["text", "dc", "ability", "tags"],
+                        "additionalProperties": False,
                     },
                 },
             },
             "required": ["narrative", "choices"],
+            "additionalProperties": False,
         }
         user = (
             "Begin the adventure with a vivid opening (4–8 sentences), establish tone, stakes, and a prompt to act.\n"
@@ -184,10 +185,12 @@ class PromptBuilder:
                             "tags": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["text", "dc", "ability", "tags"],
+                        "additionalProperties": False,
                     },
                 },
             },
             "required": ["narrative", "choices"],
+            "additionalProperties": False,
         }
         user = (
             f"Continue the story. The player acted/said:\n{player_input}\n\n"
@@ -220,6 +223,7 @@ class PromptBuilder:
                         "milestone": {"type": "boolean"},
                     },
                     "required": ["hp_delta", "xp_delta", "items_gained", "items_lost", "milestone"],
+                    "additionalProperties": False,
                 },
                 "followup_choices": {
                     "type": "array",
@@ -232,10 +236,12 @@ class PromptBuilder:
                             "tags": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["text", "dc", "ability", "tags"],
+                        "additionalProperties": False,
                     },
                 },
             },
             "required": ["narrative", "consequences", "followup_choices"],
+            "additionalProperties": False,
         }
         user = (
             f"Adjudicate the player's attempt.\nCHOICE: {json.dumps(choice)}\nROLL: {json.dumps(roll)}\n\n"
