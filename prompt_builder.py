@@ -2,10 +2,11 @@
 import json
 import os
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from openai import OpenAI
 
-MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
+PRIMARY_MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
+FALLBACK_MODEL = os.getenv("DM_FALLBACK_MODEL", "gpt-4o-mini")  # used ONLY if primary returns empty twice
 
 ALLOWED_ABILITIES_AND_SKILLS = (
     "Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|"
@@ -24,9 +25,15 @@ class PromptBuilder:
         self.client = OpenAI(api_key=api_key)
 
     # ---- GPT-5-safe chat wrapper with param fallbacks ----
-    def _chat(self, *, messages, response_format=None, temperature=None, max_tokens=1200):
+    def _chat(self, *, messages, response_format=None, temperature: Optional[float]=None,
+              max_tokens=1200, model: Optional[str]=None):
+        """
+        Try GPT-5-style params first; on specific errors, retry with compatible params.
+        Works with both 5-series (max_completion_tokens) and older models (max_tokens).
+        """
+        mdl = model or PRIMARY_MODEL
         params = {
-            "model": MODEL,
+            "model": mdl,
             "messages": messages,
             "max_completion_tokens": max_tokens,  # GPT-5 & reasoning variants
         }
@@ -51,7 +58,7 @@ class PromptBuilder:
                 except Exception as e2:
                     msg = str(e2)
 
-            # Older chat models want max_tokens, not max_completion_tokens
+            # Older chat models want max_tokens instead
             if "max_completion_tokens" in msg and ("Unsupported parameter" in msg or "Unrecognized request argument" in msg):
                 params.pop("max_completion_tokens", None)
                 params["max_tokens"] = max_tokens
@@ -60,15 +67,6 @@ class PromptBuilder:
                 except Exception as e3:
                     msg = str(e3)
 
-            # If we started with max_tokens but model wants max_completion_tokens
-            if "max_tokens" in msg and "Use 'max_completion_tokens' instead" in msg:
-                params.pop("max_tokens", None)
-                params["max_completion_tokens"] = max_tokens
-                try:
-                    return do_call(params)
-                except Exception as e4:
-                    msg = str(e4)
-
             # Some variants may not support response_format
             if "response_format" in msg and "Unsupported parameter" in msg:
                 params.pop("response_format", None)
@@ -76,7 +74,7 @@ class PromptBuilder:
 
             raise
 
-    # ---- Robust JSON call with salvage + retry ----
+    # ---- Robust JSON helpers ----
     def _extract_json(self, text: str) -> Dict[str, Any]:
         text = (text or "").strip()
         if not text:
@@ -84,40 +82,62 @@ class PromptBuilder:
         try:
             return json.loads(text)
         except Exception:
-            # salvage {...} span
             start, end = text.find("{"), text.rfind("}")
             if start != -1 and end != -1 and end > start:
                 return json.loads(text[start:end + 1])
             raise
 
-    def _call_llm_json(self, system: str, user: str, temperature: float | None = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+    def _call_llm_json_core(self, system: str, user: str, model_override: Optional[str],
+                            temperature: Optional[float], max_tokens: int) -> Dict[str, Any]:
         # Attempt 1: JSON mode
         resp = self._chat(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             temperature=temperature,
             max_tokens=max_tokens,
+            model=model_override,
         )
         text = (resp.choices[0].message.content or "").strip()
         try:
             return self._extract_json(text)
         except Exception:
-            self.log.warning("JSON parse failed (attempt 1). Raw (first 500): %r", text[:500])
+            self.log.warning("JSON parse failed (attempt 1, model=%s). Raw (first 500): %r",
+                             model_override or PRIMARY_MODEL, text[:500])
 
         # Attempt 2: stricter instruction, no response_format, default temperature
-        strict_user = user + "\nIMPORTANT: Return ONLY valid minified JSON per the schema. No commentary, no code fences, no prose."
+        strict_user = user + "\nIMPORTANT: Return ONLY valid minified JSON per the schema. No commentary, no code fences."
         resp2 = self._chat(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": strict_user}],
-            temperature=None,  # some 5-series only allow default
+            temperature=None,  # drop temp to satisfy models that only support default
             max_tokens=max_tokens,
+            model=model_override,
         )
         text2 = (resp2.choices[0].message.content or "").strip()
         try:
             return self._extract_json(text2)
         except Exception:
-            self.log.error("JSON parse failed (attempt 2). Raw (first 500): %r", text2[:500])
+            self.log.error("JSON parse failed (attempt 2, model=%s). Raw (first 500): %r",
+                           model_override or PRIMARY_MODEL, text2[:500])
+            raise ValueError("unparseable")
 
-        # Final fallback: safe minimal scene so the game continues
+    def _call_llm_json(self, system: str, user: str, temperature: Optional[float] = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+        """
+        Try primary model; if both passes fail (empty/non-JSON), try fallback model once.
+        If everything fails, return a safe minimal scene.
+        """
+        try:
+            return self._call_llm_json_core(system, user, None, temperature, max_tokens)
+        except Exception:
+            # Fallback model (only if configured and different)
+            if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
+                self.log.warning("Falling back to %s after primary model returned empty/unparseable output.",
+                                 FALLBACK_MODEL)
+                try:
+                    return self._call_llm_json_core(system, user, FALLBACK_MODEL, temperature, max_tokens)
+                except Exception:
+                    pass
+
+        # Final safety: keep the game moving
         return {
             "narrative": "The wind shifts; the world feels momentarily out of focus. Regain your bearings—what do you do?",
             "choices": []
@@ -202,9 +222,25 @@ class PromptBuilder:
             "If it's rules, be concrete; if world/lore, respect established facts.\n"
             f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
         )
-        resp = self._chat(
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.4,
-            max_tokens=400,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        # Text path (with same guardrails and fallback if needed)
+        try:
+            resp = self._chat(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.4,
+                max_tokens=400,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                raise ValueError("empty")
+            return text
+        except Exception:
+            if FALLBACK_MODEL and FALLBACK_MODEL != PRIMARY_MODEL:
+                self.log.warning("Falling back to %s for /ask.", FALLBACK_MODEL)
+                resp2 = self._chat(
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    temperature=None,
+                    max_tokens=400,
+                    model=FALLBACK_MODEL,
+                )
+                return (resp2.choices[0].message.content or "").strip()
+            return "I'll answer briefly once I get my bearings—try again in a moment."
