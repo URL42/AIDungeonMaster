@@ -20,7 +20,13 @@ class PromptBuilder:
     """
     def __init__(self, gsm):
         self.gsm = gsm
-        self.client = OpenAI()
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. "
+                "Put it in your environment or in a .env file next to dungeon_master.py."
+            )
+        self.client = OpenAI(api_key=api_key)
 
     # ---------- LLM helper ----------
     def _call_llm_json(self, system: str, user: str, temperature: float = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
@@ -41,7 +47,7 @@ class PromptBuilder:
         try:
             return json.loads(text)
         except Exception:
-            # Salvage best-effort JSON object
+            # Best-effort salvage of a JSON object
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -134,3 +140,4 @@ class PromptBuilder:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
         return resp.choices[0].message.content.strip()
+
