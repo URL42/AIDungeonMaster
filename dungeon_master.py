@@ -1,23 +1,54 @@
 # dungeon_master.py
+# ------------------------------------------------------------
+# Telegram DM Bot (tap-to-roll d20 version)
+# - Loads .env before reading any env vars
+# - Uses DM_* env names: DM_TELEGRAM_BOT_TOKEN, DM_TELEGRAM_CHAT_ID (optional)
+# - Works with prompt_builder.py & persistence.py provided
+# - python-telegram-bot v20+ style
+# ------------------------------------------------------------
+
+# --- 1) Load .env BEFORE any os.getenv calls ----------------
 import os
+try:
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(), override=False)
+except Exception:
+    # dotenv is optional; if not installed, rely on real env
+    pass
+
+# --- 2) Standard libs & telegram imports --------------------
 import random
 from typing import Dict, Any, List
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
+# --- 3) Local modules ---------------------------------------
 from persistence import GameStateManager, logger as log
 from prompt_builder import PromptBuilder
 
-# --- Env: use your DM_* names ------------------------------------------------
-BOT_TOKEN = os.getenv("DM_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+# --- 4) Small helpers ---------------------------------------
+def env(name: str, *fallbacks: str, default: str | None = None) -> str | None:
+    """
+    Resolve an env var by primary name then optional fallbacks, trimming quotes/whitespace.
+    """
+    for key in (name, *fallbacks):
+        v = os.getenv(key)
+        if v is not None:
+            return v.strip().strip('"').strip("'")
+    return default
+
+# --- 5) Env: use your DM_* names ----------------------------
+BOT_TOKEN = env("DM_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Set DM_TELEGRAM_BOT_TOKEN in your environment/.env")
-DM_CHAT_ID = os.getenv("DM_TELEGRAM_CHAT_ID")  # optional; not required to run
 
-# --- Dice & modifiers ---------------------------------------------------------
+DM_CHAT_ID = env("DM_TELEGRAM_CHAT_ID")  # optional; not required to run
+
+# --- 6) Dice & modifiers ------------------------------------
 def proficiency_bonus_for_level(level: int) -> int:
     if level >= 17: return 6
     if level >= 13: return 5
@@ -28,15 +59,20 @@ def proficiency_bonus_for_level(level: int) -> int:
 def ability_mod(score: int) -> int:
     return (score - 10) // 2
 
-# --- Helpers to render choices ------------------------------------------------
-def build_choice_keyboard(choices: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows = []
+# --- 7) UI helpers ------------------------------------------
+def build_choice_keyboard(choices: List[Dict[str, Any]]) -> InlineKeyboardMarkup | None:
+    rows: List[List[InlineKeyboardButton]] = []
     for i, c in enumerate(choices):
-        label = f"{i+1}. {c.get('text','')[:64]}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"choice:{i}")])
+        text = str(c.get("text", ""))[:64] or f"Option {i+1}"
+        rows.append([InlineKeyboardButton(f"{i+1}. {text}", callback_data=f"choice:{i}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
-async def send_scene_with_choices(update: Update, context: ContextTypes.DEFAULT_TYPE, narrative: str, choices: List[Dict[str, Any]]):
+async def send_scene_with_choices(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    narrative: str,
+    choices: List[Dict[str, Any]]
+):
     chat_id = update.effective_chat.id
     gsm: GameStateManager = context.chat_data["gsm"]
     st = gsm.get_state()
@@ -50,7 +86,7 @@ async def send_scene_with_choices(update: Update, context: ContextTypes.DEFAULT_
         kb = build_choice_keyboard(choices)
         await context.bot.send_message(chat_id, "Your move:", reply_markup=kb)
 
-# --- /start & /help -----------------------------------------------------------
+# --- 8) Commands --------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     context.chat_data["gsm"] = GameStateManager(chat_id)
@@ -58,50 +94,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pb = PromptBuilder(gsm)
 
     opener = pb.build_opening_scene()
-    await send_scene_with_choices(update, context, opener.get("narrative",""), opener.get("choices", []))
-    await context.bot.send_message(chat_id, "Tip: you can also type your own action, not just tap a choice.")
+    await send_scene_with_choices(update, context, opener.get("narrative", ""), opener.get("choices", []))
+    await context.bot.send_message(chat_id, "Tip: you can type your own action too, not just tap a choice.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
         "/start — begin or restart your adventure\n"
         "/ask <question> — ask an out-of-game rules/lore question\n"
-        "/roll — roll the pending d20 (if you’ve picked a choice)"
+        "/roll — roll the pending d20 (after you pick a choice)"
     )
 
-# --- /ask (out-of-game Q&A) ---------------------------------------------------
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     gsm: GameStateManager = context.chat_data.get("gsm") or GameStateManager(chat_id)
     context.chat_data["gsm"] = gsm
     pb = PromptBuilder(gsm)
+
     q = (update.message.text or "").partition(" ")[2].strip()
     if not q:
         await update.message.reply_text("Usage: /ask <your question>")
         return
+
     ans = pb.build_clarification_prompt(q)
     await update.message.reply_text(ans)
 
-# --- Freeform player input (go rogue) ----------------------------------------
+# --- 9) Freeform player input (go rogue) --------------------
 async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
     if not text:
         return
+
     gsm: GameStateManager = context.chat_data.get("gsm") or GameStateManager(chat_id)
     context.chat_data["gsm"] = gsm
     pb = PromptBuilder(gsm)
 
     out = pb.build_scene_prompt(text)
-    await send_scene_with_choices(update, context, out.get("narrative",""), out.get("choices", []))
+    await send_scene_with_choices(update, context, out.get("narrative", ""), out.get("choices", []))
 
-# --- Choice selected -> prompt to roll ---------------------------------------
+# --- 10) Choice selected -> prompt to roll ------------------
 async def on_choice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
+
     gsm: GameStateManager = context.chat_data.get("gsm") or GameStateManager(chat_id)
     context.chat_data["gsm"] = gsm
+    st = gsm.get_state()
 
     data = query.data  # "choice:idx"
     try:
@@ -111,7 +151,6 @@ async def on_choice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(chat_id, "I lost track of that choice—try again.")
         return
 
-    st = gsm.get_state()
     last_choices = st.get("last_choices", [])
     if idx < 0 or idx >= len(last_choices):
         await query.edit_message_reply_markup(reply_markup=None)
@@ -125,11 +164,12 @@ async def on_choice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Roll d20", callback_data="roll_d20")]])
     await context.bot.send_message(chat_id, "Ready to roll? Tap the button!", reply_markup=kb)
 
-# --- Roll handler -------------------------------------------------------------
+# --- 11) d20 roll handler ----------------------------------
 async def on_roll_d20(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
+
     gsm: GameStateManager = context.chat_data.get("gsm") or GameStateManager(chat_id)
     context.chat_data["gsm"] = gsm
     st = gsm.get_state()
@@ -141,7 +181,7 @@ async def on_roll_d20(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, "No pending action to roll for—choose an option first.")
         return
 
-    choice = last_choices[pending_idx]
+    choice = last_choices[pending_idx]  # {"text","dc","ability","tags":[]}
     dc = int(choice.get("dc", 10))
     ability_name = choice.get("ability", "Strength")
 
@@ -152,7 +192,7 @@ async def on_roll_d20(update: Update, context: ContextTypes.DEFAULT_TYPE):
     char = st.get("character", {})
     abilities = (char.get("abilities") or {})
     score = int(abilities.get(ability_name, 10))
-    mod = (score - 10) // 2
+    mod = ability_mod(score)
     prof = proficiency_bonus_for_level(int(st.get("level", 1))) if "proficient" in (choice.get("tags") or []) else 0
 
     total = d20 + mod + prof
@@ -188,7 +228,7 @@ async def on_roll_d20(update: Update, context: ContextTypes.DEFAULT_TYPE):
         inv = [x for x in inv if x not in set(items_lost)]
     st["inventory"] = inv
 
-    # Level up by XP (simple example)
+    # Simple XP leveling rule (tweak as you like)
     if st["xp"] >= (st.get("level", 1) * 300):
         st["level"] = int(st.get("level", 1)) + 1
         await context.bot.send_message(chat_id, f"✨ You reached **Level {st['level']}**!", parse_mode="Markdown")
@@ -200,15 +240,15 @@ async def on_roll_d20(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_scene_with_choices(update, context, st["last_scene"], st["last_choices"])
 
-# --- Manual /roll command -----------------------------------------------------
+# --- 12) Manual /roll command (optional) -------------------
 async def roll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Behaves like pressing the roll button
+    # Behaves like pressing the button
     fake_cq = type("F", (), {})()
     fake_cq.data = "roll_d20"
     update.callback_query = fake_cq  # type: ignore
     return await on_roll_d20(update, context)
 
-# --- Main ---------------------------------------------------------------------
+# --- 13) Main entrypoint -----------------------------------
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
