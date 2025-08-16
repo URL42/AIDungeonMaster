@@ -4,12 +4,7 @@ import os
 import logging
 from typing import Dict, Any
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
+# Ensure dirs exist
 LOG_DIR = os.getenv("DM_LOG_DIR", "./logs")
 DATA_DIR = os.getenv("DM_DATA_DIR", "./data")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -49,7 +44,7 @@ class GameStateManager:
                 "name": "",
                 "class": "",
                 "motivation": "",
-                "abilities": {  # ability scores (10 = +0)
+                "abilities": {
                     "Strength": 10, "Dexterity": 10, "Constitution": 10,
                     "Intelligence": 10, "Wisdom": 10, "Charisma": 10
                 },
@@ -62,7 +57,7 @@ class GameStateManager:
             "summary": "",
             "last_scene": "",
             "last_choices": [],
-            "pending_choice_index": None,  # for the tap-to-roll step
+            "pending_choice_index": None,
         }
 
     def _load(self):
@@ -93,4 +88,3 @@ class GameStateManager:
     def reset(self):
         self._state = self._default_state()
         self.save_state(self._state)
-
