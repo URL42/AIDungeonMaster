@@ -1,97 +1,136 @@
 # prompt_builder.py
 import json
+import os
+from typing import Dict, Any
+from openai import OpenAI
+
+MODEL = os.getenv("DM_OPENAI_MODEL", "gpt-5")
+
+ALLOWED_ABILITIES_AND_SKILLS = (
+    "Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|"
+    "Perception|Stealth|Athletics|Arcana|History|Insight|Investigation|"
+    "Medicine|Nature|Religion|Animal Handling|Deception|Intimidation|"
+    "Performance|Persuasion"
+)
 
 class PromptBuilder:
+    """
+    Builds prompts for the Dungeon Master game and calls the LLM with structured outputs.
+    All story generations return strict JSON for deterministic UI/logic.
+    """
     def __init__(self, gsm):
         self.gsm = gsm
+        self.client = OpenAI()
 
-    def build_scene_prompt(self, user_input: str) -> str:
-        st = self.gsm.get_state()
-        return (
-            f"You are the Dungeon Master. Game state:\n{json.dumps(st, indent=2)}\n\n"
-            f"Player says: {user_input}\n\n"
-            "Reply in this format:\n"
-            "narrative: [describe what happens next]\n\n"
-            "choices:\n"
-            "1) [Choice text] (DC X Ability)\n"
-            "2) [Choice text] (DC X Ability)\n"
-            "3) [Choice text] (DC X Ability)\n\n"
-            "Only include 'choices:' if meaningful player decisions are available.\n"
-            "DO NOT describe the outcome of the roll — wait until the player rolls.\n"
-            "Your tone must be immersive, dramatic, and genre-consistent."
+    # ---------- LLM helper ----------
+    def _call_llm_json(self, system: str, user: str, temperature: float = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+        """
+        Call the model and require JSON output.
+        """
+        resp = self.client.chat.completions.create(
+            model=MODEL,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ],
         )
+        text = resp.choices[0].message.content.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            # Salvage best-effort JSON object
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(text[start:end+1])
+            raise
 
-    def build_npc_prompt(self, npc_name: str) -> str:
+    # ---------- Prompts ----------
+    def build_opening_scene(self) -> Dict[str, Any]:
         st = self.gsm.get_state()
-        loc = st.get("current_location") or "somewhere"
-        return (
-            f"Roleplay NPC '{npc_name}' in {loc}.\n"
-            f"Story context:\n{st.get('story', '')}\n\n"
-            "Response should include:\n"
-            "- Character-appropriate dialogue\n"
-            "- A possible quest hook or secret\n"
-            "- Optional suggestions for skill checks or reactions\n"
-            "DO NOT resolve any rolls — let the player roll."
+        system = "You are a masterful, fair Dungeon Master for a Telegram text adventure."
+        compact = {
+            "character": st.get("character", {}),
+            "world": st.get("world", {}),
+            "level": st.get("level", 1),
+            "xp": st.get("xp", 0),
+            "summary": st.get("summary", ""),
+        }
+        user = (
+            "Begin the adventure with a vivid opening (4–8 sentences), establish tone, stakes, and a prompt to act.\n"
+            "Return STRICT JSON (no code fences):\n"
+            "{\n"
+            '  "narrative": "string",\n'
+            f'  "choices": [ {{"text":"string","dc": int, "ability": "{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
+            "}\n"
+            "2–4 choices. Each must include a relevant ability or skill."
+            f"\n\nSTATE:\n{json.dumps(compact)}"
         )
+        return self._call_llm_json(system, user)
+
+    def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
+        st = self.gsm.get_state()
+        system = "You are a masterful, fair Dungeon Master for a Telegram text adventure."
+        compact = {
+            "character": st.get("character", {}),
+            "level": st.get("level", 1),
+            "xp": st.get("xp", 0),
+            "summary": st.get("summary", ""),
+            "last_scene": st.get("last_scene", ""),
+        }
+        user = (
+            "Continue the story. The player acted/said:\n"
+            f"{player_input}\n\n"
+            "Return STRICT JSON (no code fences):\n"
+            "{\n"
+            '  "narrative": "string",\n'
+            f'  "choices": [ {{"text":"string","dc": int, "ability": "{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
+            "}\n"
+            "Allow the player to go off-list; remain coherent and responsive."
+            f"\n\nSTATE:\n{json.dumps(compact)}"
+        )
+        return self._call_llm_json(system, user)
+
+    def build_outcome_prompt(self, choice: Dict[str, Any], roll: Dict[str, Any]) -> Dict[str, Any]:
+        st = self.gsm.get_state()
+        system = "You are a fair DM adjudicating checks; reward success, narrate setbacks on failure."
+        compact = {
+            "character": st.get("character", {}),
+            "level": st.get("level", 1),
+            "xp": st.get("xp", 0),
+            "summary": st.get("summary", ""),
+            "last_scene": st.get("last_scene", ""),
+        }
+        user = (
+            "Adjudicate the player's attempt.\n"
+            f"CHOICE: {json.dumps(choice)}\n"
+            f"ROLL: {json.dumps(roll)}\n\n"
+            "Return STRICT JSON (no code fences):\n"
+            "{\n"
+            '  "narrative": "string",\n'
+            '  "consequences": {"hp_delta": 0, "xp_delta": 0, "items_gained": [], "items_lost": [], "milestone": false},\n'
+            f'  "followup_choices": [ {{"text":"string","dc": int, "ability":"{ALLOWED_ABILITIES_AND_SKILLS}","tags":[] }} ]\n'
+            "}\n"
+            "XP guidance: success ≈ DC*10, failure ≈ DC*5. Consider milestone for major beats."
+            f"\n\nSTATE:\n{json.dumps(compact)}"
+        )
+        return self._call_llm_json(system, user, temperature=0.7)
 
     def build_clarification_prompt(self, question: str) -> str:
         st = self.gsm.get_state()
-        return (
-            f"Clarify this question about the game world: '{question}'\n"
-            f"Game state:\n{json.dumps(st, indent=2)}\n"
-            "Answer concisely and consistently with prior events."
+        system = "You answer rules/lore questions succinctly (3–6 sentences)."
+        user = (
+            "Answer the player's out-of-game question clearly and briefly. "
+            "If it's rules, be concrete; if world/lore, respect established facts.\n"
+            f"QUESTION: {question}\nSTATE SUMMARY: {st.get('summary','')}\n"
         )
-
-    def build_intro_prompt(self, user_data: dict) -> str:
-        genre = user_data.get("genre", "Fantasy")
-        char = user_data.get("character", {})
-        name = char.get("name", "Unknown")
-        char_class = char.get("class", "Adventurer")
-        motivation = char.get("motivation", "Unknown purpose")
-        return (
-            f"Imagine a {genre} world with a vivid tone and rich setting.\n"
-            f"The main character is {name}, a {char_class}, driven by the goal: {motivation}.\n\n"
-            "Create an opening scene with:\n"
-            "1. A compelling environment that fits the genre\n"
-            "2. A personal and immediate challenge that ties directly to their motivation and class\n"
-            "3. 3 choices, each with a (DC X Ability) format\n\n"
-            "Format like:\n"
-            "1) Persuade the guard (DC 15 Charisma)\n"
-            "2) Sneak past (DC 12 Dexterity)\n"
-            "3) Cast an illusion (DC 14 Intelligence)\n"
+        resp = self.client.chat.completions.create(
+            model=MODEL,
+            temperature=0.4,
+            max_tokens=400,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
-
-    def build_outcome_prompt(self, action: str, check_result: dict = None) -> str:
-        state = self.gsm.get_state()
-        roll_txt = ""
-        if check_result:
-            roll_txt = (
-                f"Resolve this action: {action}\n"
-                f"Ability Check: {check_result['ability']}\n"
-                f"Roll: {check_result['roll']} + Modifier {check_result['mod']} = {check_result['total']}\n"
-                f"Target DC: {check_result['dc']}\n"
-                f"Result: {'Success' if check_result['total'] >= check_result['dc'] else 'Failure'}\n\n"
-            )
-        return (
-            f"{roll_txt}"
-            "Narrate the outcome of the check. Include:\n"
-            "- Impact on the player and world\n"
-            "- Consequences of the action\n"
-            "- New tension or open-ended situation\n\n"
-            f"Game state:\n{json.dumps(state, indent=2)}"
-        )
-
-    # Optional legacy version; not currently used in your flow
-    #def build_prompt(self, user_data: dict, user_input: str) -> str:
-    #    st = self.gsm.get_state()
-    #    loc = st.get("current_location") or "somewhere"
-    #    return (
-    #        f"Location: {loc}\n"
-    #        f"Character: {json.dumps(user_data.get('character', {}))}\n"
-    #        f"Action: {user_input}\n\n"
-    #        "Respond with:\n"
-    #        "1. Narrative consequences\n"
-    #        "2. New challenges/choices\n"
-    #        "3. [ROLL:Ability] tags when needed\n"
-    #        "Maintain story continuity and game rules"
-    #    )
+        return resp.choices[0].message.content.strip()
