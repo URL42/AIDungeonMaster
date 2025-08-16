@@ -1,6 +1,7 @@
 # prompt_builder.py
 import json
 import os
+import logging
 from typing import Dict, Any
 from openai import OpenAI
 
@@ -16,16 +17,14 @@ ALLOWED_ABILITIES_AND_SKILLS = (
 class PromptBuilder:
     def __init__(self, gsm):
         self.gsm = gsm
+        self.log = logging.getLogger("dm_bot")
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DM_OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY / DM_OPENAI_API_KEY not set.")
         self.client = OpenAI(api_key=api_key)
 
-    # ---- GPT-5 safe chat wrapper ----
+    # ---- GPT-5-safe chat wrapper with param fallbacks ----
     def _chat(self, *, messages, response_format=None, temperature=None, max_tokens=1200):
-        """
-        Try GPT-5-style params first. On specific errors, retry with compatible params.
-        """
         params = {
             "model": MODEL,
             "messages": messages,
@@ -61,7 +60,7 @@ class PromptBuilder:
                 except Exception as e3:
                     msg = str(e3)
 
-            # If we started with max_tokens (older path) but model wants max_completion_tokens
+            # If we started with max_tokens but model wants max_completion_tokens
             if "max_tokens" in msg and "Use 'max_completion_tokens' instead" in msg:
                 params.pop("max_tokens", None)
                 params["max_completion_tokens"] = max_tokens
@@ -75,24 +74,54 @@ class PromptBuilder:
                 params.pop("response_format", None)
                 return do_call(params)
 
-            # If we reach here, bubble up the original error
+            raise
+
+    # ---- Robust JSON call with salvage + retry ----
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty content")
+        try:
+            return json.loads(text)
+        except Exception:
+            # salvage {...} span
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(text[start:end + 1])
             raise
 
     def _call_llm_json(self, system: str, user: str, temperature: float | None = 0.8, max_tokens: int = 1200) -> Dict[str, Any]:
+        # Attempt 1: JSON mode
         resp = self._chat(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        text = resp.choices[0].message.content.strip()
+        text = (resp.choices[0].message.content or "").strip()
         try:
-            return json.loads(text)
+            return self._extract_json(text)
         except Exception:
-            start, end = text.find("{"), text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end+1])
-            raise
+            self.log.warning("JSON parse failed (attempt 1). Raw (first 500): %r", text[:500])
+
+        # Attempt 2: stricter instruction, no response_format, default temperature
+        strict_user = user + "\nIMPORTANT: Return ONLY valid minified JSON per the schema. No commentary, no code fences, no prose."
+        resp2 = self._chat(
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": strict_user}],
+            temperature=None,  # some 5-series only allow default
+            max_tokens=max_tokens,
+        )
+        text2 = (resp2.choices[0].message.content or "").strip()
+        try:
+            return self._extract_json(text2)
+        except Exception:
+            self.log.error("JSON parse failed (attempt 2). Raw (first 500): %r", text2[:500])
+
+        # Final fallback: safe minimal scene so the game continues
+        return {
+            "narrative": "The wind shifts; the world feels momentarily out of focus. Regain your bearings—what do you do?",
+            "choices": []
+        }
 
     # ---------- Prompts ----------
     def build_opening_scene(self) -> Dict[str, Any]:
@@ -115,7 +144,6 @@ class PromptBuilder:
             "2–4 choices. Each must include a relevant ability or skill."
             f"\n\nSTATE:\n{json.dumps(compact)}"
         )
-        # temperature will be dropped automatically if the model forbids it
         return self._call_llm_json(system, user, temperature=0.8)
 
     def build_scene_prompt(self, player_input: str) -> Dict[str, Any]:
@@ -179,4 +207,4 @@ class PromptBuilder:
             temperature=0.4,
             max_tokens=400,
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
