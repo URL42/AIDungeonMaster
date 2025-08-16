@@ -1,7 +1,6 @@
 # persistence.py
 import json
 import logging
-import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -11,16 +10,41 @@ from telegram.ext import BasePersistence, PersistenceInput
 
 # ---------- Logger ----------
 def setup_logger(name: str = "dm_bot", filename: str = "dm_bot.log") -> logging.Logger:
-    log_dir = Path("logs"); log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / filename
+    """
+    Resilient logger: tries ./logs, falls back to ~/.dm_bot on permission errors.
+    """
+    log_dir = Path("logs")
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_dir = Path.home() / ".dm_bot"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+    primary_log = log_dir / filename
     logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
-        fh = logging.FileHandler(log_path, encoding="utf-8"); fh.setLevel(logging.DEBUG)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh.setFormatter(fmt)
-        sh = logging.StreamHandler(); sh.setLevel(logging.INFO); sh.setFormatter(fmt)
-        logger.addHandler(fh); logger.addHandler(sh)
+    if logger.handlers:
+        return logger  # already configured
+
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    # Console handler
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    # File handler (with fallback if permission denied)
+    try:
+        fh = logging.FileHandler(primary_log, encoding="utf-8")
+    except PermissionError:
+        fallback = Path.home() / ".dm_bot" / filename
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(fallback, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
     return logger
 
 logger = setup_logger()
@@ -105,6 +129,7 @@ class GameStateManager:
         return self.state
 
     def save(self):
+        assert self.filename is not None
         self.filename.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.debug(f"Saved state for {self.user_id}")
 
@@ -118,8 +143,10 @@ class GameStateManager:
             pass
         backups = sorted(self.save_dir.glob(f"{self.user_id}.*.bak.json"))
         for old in backups[:-5]:
-            try: old.unlink()
-            except Exception: pass
+            try:
+                old.unlink()
+            except Exception:
+                pass
 
     # ---- XP / Level ----
     def award_xp(self, amount: int):
@@ -157,14 +184,11 @@ class GameStateManager:
         char = self.state.get("character", {})
         profs = set(char.get("proficiencies", []))
         mode = self.state.get("roll_mode", "normal")
-        key = ability_or_skill.strip()
-        # normalize
-        key = key.title()
+        key = (ability_or_skill or "Strength").strip().title()
         abbr, skills = SKILL_MAP.get(key, ("STR", []))
 
         ability_scores = char.get("abilities", {})
-        score = ability_scores.get(abbr, 10)
-        score = int(score)
+        score = int(ability_scores.get(abbr, 10))
         mod = ability_mod(score)
 
         import random
@@ -194,7 +218,7 @@ class GameStateManager:
             "success": total >= int(dc),
         }
 
-# ---------- Telegram Persistence (PTB) ----------
+# ---------- Telegram Persistence (PTB v20-complete) ----------
 class TelegramJSONPersistence(BasePersistence):
     """
     JSON file persistence for PTB v20+. Implements all required async methods so
@@ -211,7 +235,6 @@ class TelegramJSONPersistence(BasePersistence):
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
-                # If the file is corrupted, keep defaults and overwrite on next save.
                 pass
 
     def _save(self):
@@ -219,15 +242,14 @@ class TelegramJSONPersistence(BasePersistence):
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    # --- REQUIRED: what we want PTB to store ---
+    # --- REQUIRED: what to persist ---
     def get_persistence_input(self) -> PersistenceInput:
-        # Persist *everything* (user/chat/bot data, conversations, callback_data)
         return PersistenceInput(
             user_data=True, chat_data=True, bot_data=True,
             conversations=True, callback_data=True
         )
 
-    # --- REQUIRED: user/chat/bot data getters ---
+    # --- REQUIRED: getters ---
     async def get_user_data(self) -> Dict[str, Dict[str, Any]]:
         return self.data.get("user_data", {})
 
@@ -237,16 +259,13 @@ class TelegramJSONPersistence(BasePersistence):
     async def get_bot_data(self) -> Dict[str, Any]:
         return self.data.get("bot_data", {})
 
-    # --- REQUIRED: conversations (plural!) ---
     async def get_conversations(self, name: str) -> Dict[str, object]:
-        # PTB expects a mapping of key -> state for a given conversation name
         return self.data.get("conversations", {}).get(name, {}).copy()
 
-    # --- REQUIRED: callback data ---
     async def get_callback_data(self) -> Dict[str, Any]:
         return self.data.get("callback_data", {})
 
-    # --- REQUIRED: updaters (PTB calls these when state changes) ---
+    # --- REQUIRED: updaters ---
     async def update_user_data(self, user_id: int, data: Dict[str, Any]):
         self.data.setdefault("user_data", {})[str(user_id)] = data
         self._save()
@@ -272,7 +291,7 @@ class TelegramJSONPersistence(BasePersistence):
         self.data["callback_data"] = data
         self._save()
 
-    # --- REQUIRED: drops (PTB cleans up when a user/chat disappears) ---
+    # --- REQUIRED: drops ---
     async def drop_user_data(self, user_id: int):
         self.data.get("user_data", {}).pop(str(user_id), None)
         self._save()
@@ -281,9 +300,8 @@ class TelegramJSONPersistence(BasePersistence):
         self.data.get("chat_data", {}).pop(str(chat_id), None)
         self._save()
 
-    # --- REQUIRED: refresh (PTB gives you the in-memory dict it's using) ---
+    # --- REQUIRED: refresh (sync in-memory dicts to disk) ---
     async def refresh_user_data(self, user_id: int, user_data: Dict[str, Any]):
-        # Keep our backing store in sync with PTB's in-memory reference
         self.data.setdefault("user_data", {})[str(user_id)] = user_data
         self._save()
 
@@ -295,6 +313,7 @@ class TelegramJSONPersistence(BasePersistence):
         self.data["bot_data"] = bot_data
         self._save()
 
-    # --- REQUIRED: flush (PTB may call this on shutdown) ---
+    # --- REQUIRED: flush ---
     async def flush(self):
         self._save()
+
