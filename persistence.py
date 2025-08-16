@@ -1,260 +1,255 @@
 # persistence.py
-import os
 import json
-import shutil
 import logging
+import os
+import shutil
 import time
-from telegram.ext import BasePersistence, PersistenceInput
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, Optional
+from telegram.ext import BasePersistence, PersistenceInput
 
-    # === Logger Handler ===
-
-def setup_logger(name='dungeon_master', filename='dungeon_master.log'):
-    log_dir = Path("logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
+# ---------- Logger ----------
+def setup_logger(name: str = "dm_bot", filename: str = "dm_bot.log") -> logging.Logger:
+    log_dir = Path("logs"); log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / filename
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-
     if not logger.handlers:
-        fh = logging.FileHandler(log_path)
-        fh.setLevel(logging.DEBUG)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-        logger.addHandler(fh)
-        logger.addHandler(ch)
-
+        logger.setLevel(logging.DEBUG)
+        fh = logging.FileHandler(log_path, encoding="utf-8"); fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(); sh.setLevel(logging.INFO); sh.setFormatter(fmt)
+        logger.addHandler(fh); logger.addHandler(sh)
     return logger
 
-class TelegramJSONPersistence(BasePersistence):
-    """Persistence layer for Telegram bot state (user/chat/bot/convo/callback)."""
-    def __init__(
-        self,
-        filepath="bot_data.json",
-        history_filepath="conversation_history.json",
-        store_data=PersistenceInput(
-            user_data=True,
-            chat_data=True,
-            bot_data=True,
-            callback_data=True
-        )
-    ):
-        super().__init__(store_data=store_data)
-        self.filepath = filepath
-        self.history_filepath = history_filepath
-        self._data = self._load_data()
-        self._history = self._load_history()
+logger = setup_logger()
 
-    def _load_data(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logging.error(f"Failed loading bot data: {e}")
-        return {
-            "user_data": {},
-            "chat_data": {},
-            "bot_data": {},
-            "conversation_data": {},
-            "callback_data": {}
-        }
+# ---------- Defaults & helpers ----------
+DEFAULT_STATE = {
+    "character": {
+        "name": "",
+        "race_class": "",
+        "motivation": "",
+        "abilities": {"STR": 10, "DEX": 10, "CON": 10, "INT": 10, "WIS": 10, "CHA": 10},
+        "proficiencies": [],
+        "hp": 10,
+        "max_hp": 10,
+    },
+    "inventory": [],
+    "quests": [],
+    "world": {"genre": ""},
+    "level": 1,
+    "xp": 0,
+    "summary": "",
+    "last_scene": "",
+    "choice_buffer": {"scene_id": "", "choices": []},
+    "roll_mode": "normal",  # normal | advantage | disadvantage
+    "last_rest_ts": 0,
+}
 
-    def _load_history(self):
-        if os.path.exists(self.history_filepath):
-            try:
-                with open(self.history_filepath, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logging.error(f"Failed loading history: {e}")
-        return {}
+XP_THRESHOLDS = [0, 300, 900, 2700, 6500, 14000, 23000, 34000, 48000, 64000]
 
-    def _save_data(self):
-        try:
-            with open(self.filepath, "w") as f:
-                json.dump(self._data, f, indent=2)
-        except Exception as e:
-            logging.error(f"Failed saving bot data: {e}")
+SKILL_MAP = {
+    "Strength": ("STR", []),
+    "Dexterity": ("DEX", ["Acrobatics", "Stealth"]),
+    "Constitution": ("CON", []),
+    "Intelligence": ("INT", ["Arcana", "History", "Investigation", "Nature", "Religion"]),
+    "Wisdom": ("WIS", ["Animal Handling", "Insight", "Medicine", "Perception"]),
+    "Charisma": ("CHA", ["Deception", "Intimidation", "Performance", "Persuasion"]),
+    # explicit skills
+    "Athletics": ("STR", ["Athletics"]),
+    "Stealth": ("DEX", ["Stealth"]),
+    "Arcana": ("INT", ["Arcana"]),
+    "History": ("INT", ["History"]),
+    "Insight": ("WIS", ["Insight"]),
+    "Investigation": ("INT", ["Investigation"]),
+    "Medicine": ("WIS", ["Medicine"]),
+    "Nature": ("INT", ["Nature"]),
+    "Religion": ("INT", ["Religion"]),
+    "Animal Handling": ("WIS", ["Animal Handling"]),
+    "Deception": ("CHA", ["Deception"]),
+    "Intimidation": ("CHA", ["Intimidation"]),
+    "Performance": ("CHA", ["Performance"]),
+    "Persuasion": ("CHA", ["Persuasion"]),
+    "Perception": ("WIS", ["Perception"]),
+}
 
-    def _save_history(self):
-        try:
-            with open(self.history_filepath, "w") as f:
-                json.dump(self._history, f, indent=2)
-        except Exception as e:
-            logging.error(f"Failed saving history: {e}")
+def ability_mod(score: int) -> int:
+    return (score - 10) // 2
 
-    # Telegram bot state handlers
-    async def get_user_data(self): return self._data.get("user_data", {})
-    async def update_user_data(self, user_id, data):
-        self._data.setdefault("user_data", {})[str(user_id)] = data
-        self._save_data()
+def proficiency_bonus(level: int) -> int:
+    # 1-4:+2, 5-8:+3, 9-12:+4, 13-16:+5, 17-20:+6
+    return 2 + (max(1, level) - 1) // 4
 
-    async def get_chat_data(self): return self._data.get("chat_data", {})
-    async def update_chat_data(self, chat_id, data):
-        self._data.setdefault("chat_data", {})[str(chat_id)] = data
-        self._save_data()
-
-    async def get_bot_data(self): return self._data.get("bot_data", {})
-    async def update_bot_data(self, data):
-        self._data["bot_data"] = data
-        self._save_data()
-
-    async def get_conversations(self, name):
-        return self._data.get("conversation_data", {}).get(name, {})
-    async def update_conversation(self, name, key, new_state):
-        conv = self._data.setdefault("conversation_data", {}).setdefault(name, {})
-        if new_state:
-            conv[str(key)] = new_state
-        else:
-            conv.pop(str(key), None)
-        self._save_data()
-
-    async def get_callback_data(self): return self._data.get("callback_data", {})
-    async def update_callback_data(self, data):
-        self._data["callback_data"] = data
-        self._save_data()
-
-    async def drop_user_data(self, user_id):
-        self._data.get("user_data", {}).pop(str(user_id), None)
-        self._save_data()
-
-    async def drop_chat_data(self, chat_id):
-        self._data.get("chat_data", {}).pop(str(chat_id), None)
-        self._save_data()
-
-    async def flush(self):
-        self._save_data()
-        self._save_history()
-
-    # History utilities
-    def add_game_history(self, user_id, entry):
-        self._history.setdefault(str(user_id), []).append(entry)
-        self._save_history()
-
+# ---------- GameState ----------
+@dataclass
 class GameStateManager:
-    """Manages RPG game state with auto-saving and rotating backups."""
-    def __init__(self, user_id: str, save_dir="saves", slot_count=3):
-        self.user_id = user_id
-        self.slot_count = slot_count
-        self.save_dir = os.path.join(save_dir, str(user_id))
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.current_slot = 0
-        self.state = self._load_latest_or_default()
+    user_id: int
+    save_dir: Path = field(default_factory=lambda: Path("saves"))
+    filename: Optional[Path] = None
+    state: Dict[str, Any] = field(default_factory=lambda: json.loads(json.dumps(DEFAULT_STATE)))
 
-    def _slot_filename(self, slot_index):
-        return os.path.join(self.save_dir, f"save_slot_{slot_index+1}.json")
-
-    def update_character(self, key: str, value):
-        self.state.setdefault("character", {})[key] = value
-        self.save()
-
-    def _load_latest_or_default(self):
-        """Load the newest save slot, or return default state."""
-        latest = None
-        latest_time = 0
-        for i in range(self.slot_count):
-            path = self._slot_filename(i)
-            if os.path.exists(path):
-                mtime = os.path.getmtime(path)
-                if mtime > latest_time:
-                    latest_time = mtime
-                    latest = path
-        if latest:
+    def __post_init__(self):
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.filename = self.save_dir / f"{self.user_id}.json"
+        if self.filename.exists():
             try:
-                with open(latest, "r") as f:
-                    logging.info(f"Loaded game state from {latest}")
-                    return json.load(f)
+                self.state = json.loads(self.filename.read_text(encoding="utf-8"))
+                logger.info(f"Loaded state for {self.user_id}")
             except Exception as e:
-                logging.error(f"Failed loading slot {latest}: {e}")
-        return {
-            "current_location": None,
-            "story": "",
-            "conversation_history": [],
-            "character": {},
-            "inventory": [],
-            "quests": [],
-            "world_data": {}
-        }
+                logger.error(f"Failed to load state: {e} — using defaults")
+
+    # ---- Core state ----
+    def get_state(self) -> Dict[str, Any]:
+        return self.state
 
     def save(self):
-        """Save current state to next rotating slot."""
-        self.current_slot = (self.current_slot + 1) % self.slot_count
-        path = self._slot_filename(self.current_slot)
-        try:
-            tmp = f"{path}.{int(time.time())}.tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.state, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            logging.info(f"Saved game state to slot {self.current_slot + 1}")
-        except Exception as e:
-            logging.error(f"Error saving game slot: {e}")
+        self.filename.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug(f"Saved state for {self.user_id}")
 
-    def restore_latest(self):
-        """Restore the most recent save slot."""
-        self.state = self._load_latest_or_default()
-
-    def get_state(self):
-        return self.state
-
-    def update_state(self, updates: dict):
-        """Apply updates to the game state and save."""
-        def _deep_merge(old, new):
-            for k, v in new.items():
-                if isinstance(v, dict) and isinstance(old.get(k), dict):
-                    _deep_merge(old[k], v)
-                else:
-                    old[k] = v
-            return old
-        _deep_merge(self.state, updates)
+    def autosave(self):
         self.save()
-        return self.state
-
-    def log_action(self, entry: str):
-        """Append entry to conversation history and save."""
-        self.state.setdefault("conversation_history", []).append(entry)
-        self.save()
-
-    def handle_freeform(self, prompt: str, user_data: dict) -> str:
-        """Generate response via GPT and log it."""
+        ts = int(time.time())
+        backup = self.save_dir / f"{self.user_id}.{ts}.bak.json"
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=os.getenv("DM_OPENAI_API_KEY"))
-            response = client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[
-                    {"role": "system", "content": "You are a Dungeon Master crafting a rich and immersive world."},
-                    {"role": "user", "content": prompt}
-                ]
+            shutil.copy(self.filename, backup)
+        except Exception:
+            pass
+        backups = sorted(self.save_dir.glob(f"{self.user_id}.*.bak.json"))
+        for old in backups[:-5]:
+            try: old.unlink()
+            except Exception: pass
+
+    # ---- XP / Level ----
+    def award_xp(self, amount: int):
+        self.state["xp"] = max(0, self.state.get("xp", 0) + int(amount))
+        self._maybe_level_up()
+
+    def award_milestone(self):
+        cur = self.state.get("xp", 0)
+        lvl = self.state.get("level", 1)
+        next_needed = XP_THRESHOLDS[min(lvl, len(XP_THRESHOLDS)-1)]
+        if cur < next_needed:
+            self.state["xp"] = next_needed
+        self._maybe_level_up()
+
+    def _maybe_level_up(self):
+        xp = self.state.get("xp", 0)
+        new_level = 1
+        for i, thresh in enumerate(XP_THRESHOLDS):
+            if xp >= thresh:
+                new_level = i + 1
+        if new_level > self.state.get("level", 1):
+            self.state["level"] = new_level
+            # modest HP bump
+            self.state["character"]["max_hp"] += 3
+            self.state["character"]["hp"] = min(
+                self.state["character"]["hp"] + 3,
+                self.state["character"]["max_hp"]
             )
-            result = response.choices[0].message.content.strip()
-            self.state.setdefault("conversation_history", []).append(f"DM: {result}")
-            self.save()
-            return result
-        except Exception as e:
-            logging.error(f"[handle_freeform ERROR]: {e}")
-            return "⚠️ The Dungeon Master stares blankly, as if something broke in the multiverse..."
 
-    # === Property Helpers ===
+    # ---- Rolls ----
+    def compute_check(self, ability_or_skill: str, dc: int) -> Dict[str, Any]:
+        """
+        Computes a d20 check under roll_mode (normal/advantage/disadvantage).
+        """
+        char = self.state.get("character", {})
+        profs = set(char.get("proficiencies", []))
+        mode = self.state.get("roll_mode", "normal")
+        key = ability_or_skill.strip()
+        # normalize
+        key = key.title()
+        abbr, skills = SKILL_MAP.get(key, ("STR", []))
 
-    @property
-    def character(self) -> dict:
-        return self.state.setdefault("character", {})
+        ability_scores = char.get("abilities", {})
+        score = ability_scores.get(abbr, 10)
+        score = int(score)
+        mod = ability_mod(score)
 
-    @property
-    def inventory(self) -> list:
-        return self.state.setdefault("inventory", [])
+        import random
+        d1 = random.randint(1, 20)
+        d2 = random.randint(1, 20)
+        if mode == "advantage":
+            d20 = max(d1, d2)
+            raw = (d1, d2)
+        elif mode == "disadvantage":
+            d20 = min(d1, d2)
+            raw = (d1, d2)
+        else:
+            d20 = d1
+            raw = (d1,)
 
-    @property
-    def abilities(self) -> dict:
-        return self.character.setdefault("abilities", {})
+        prof = proficiency_bonus(self.state.get("level", 1)) if any(s in profs for s in skills) or key in profs else 0
+        total = d20 + mod + prof
+        return {
+            "mode": mode,
+            "raw": list(raw),
+            "d20": d20,
+            "mod": mod,
+            "prof": prof,
+            "total": total,
+            "dc": int(dc),
+            "ability": ability_or_skill,
+            "success": total >= int(dc),
+        }
 
+# ---------- Telegram Persistence (PTB) ----------
+class TelegramJSONPersistence(BasePersistence):
+    """
+    Minimal PTB persistence to keep user/chat/bot data & conversations across restarts.
+    This is additive to the per-user GameStateManager saves.
+    """
+    def __init__(self, path: str = "ptb_persistence.json"):
+        super().__init__()
+        self.path = Path(path)
+        self.data: Dict[str, Any] = {
+            "user_data": {}, "chat_data": {}, "bot_data": {},
+            "conversations": {}, "callback_data": {}
+        }
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
 
-        except Exception as e:
-            print(f"[handle_freeform ERROR]: {e}")
-            return "⚠️ The Dungeon Master stares blankly, as if something broke in the multiverse..."
+    def _save(self):
+        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    async def get_user_data(self) -> Dict[str, Dict[str, Any]]:
+        return self.data.get("user_data", {})
+
+    async def get_chat_data(self) -> Dict[str, Dict[str, Any]]:
+        return self.data.get("chat_data", {})
+
+    async def get_bot_data(self) -> Dict[str, Any]:
+        return self.data.get("bot_data", {})
+
+    async def update_conversation(self, name: str, key: tuple, new_state: Optional[object]):
+        convs = self.data.setdefault("conversations", {}).setdefault(name, {})
+        if new_state is None:
+            convs.pop(str(key), None)
+        else:
+            convs[str(key)] = new_state
+        self._save()
+
+    async def get_conversation(self, name: str, key: tuple) -> Optional[object]:
+        return self.data.get("conversations", {}).get(name, {}).get(str(key))
+
+    async def get_callback_data(self) -> Dict[str, Any]:
+        return self.data.get("callback_data", {})
+
+    async def update_callback_data(self, data: Dict[str, Any]):
+        self.data["callback_data"] = data
+        self._save()
+
+    async def update_user_data(self, user_id: int, data: Dict[str, Any]):
+        self.data.setdefault("user_data", {})[str(user_id)] = data
+        self._save()
+
+    async def update_chat_data(self, chat_id: int, data: Dict[str, Any]):
+        self.data.setdefault("chat_data", {})[str(chat_id)] = data
+        self._save()
+
+    def get_persistence_input(self) -> PersistenceInput:
+        return PersistenceInput(user_data=True, chat_data=True, bot_data=True, conversations=True, callback_data=True)
